@@ -1,0 +1,64 @@
+NIMA Phase II — Extractor Validation Report
+============================================================
+Source XLSX:       NIMA_Phase2_Master_Schedule_LOCKED-3.xlsx
+Sheet used:        Master Build List
+Sheets found:      ['Master Build List']
+Header row:        5
+Columns detected:  48
+Non-empty rows:    98
+
+Geometry rows:     55
+Material rows:     16
+Rule rows:         17
+Spot-check rows:   7
+Skipped rows:      3
+
+Generate Geometry? (geometry rows only):
+   28  Reference Only now
+   10  Reference Only
+    9  Yes
+    7  Debug Only
+    1  VERIFY
+
+Verification Status (geometry rows only):
+   36  VERIFY
+   18  Accepted
+    1  Optional
+
+Polygon rows:
+  attempted:  6
+  succeeded:  6
+  - row  31 ZONE_GRND_RECYC: priority=P1 verts=4 src='USER DECISION - FINAL'
+  - row  32 ZONE_F2_OVERLOOK_POLYGON_VERIFIED: priority=P2 verts=4 src='Verified corner points'
+  - row  36 ZONE_PALLET: priority=P1 verts=4 src='USER DECISION - FINAL'
+  - row  60 ELEM_GRND_RECYC_CAGE: priority=P2 verts=4 src='[Footprint matches'
+  - row  61 ELEM_PALLET_FLOOR_PLATE: priority=P2 verts=4 src='[Footprint matches'
+  - row  91 ROOF_POLYGON_VERIFY: priority=P3 verts=16 src='first bare-pair sequence outside superseded regions'
+
+Segment-list / window-marker rows:
+  - row 103 F1_GLASS_CW_SEGMENTS: {'segments_parsed': 5}
+  - row 104 F1_WINDOWS_HB_EAST_NORTH: {'window_markers_parsed': 8}
+  - row 105 F2_GLASS_CW_SEGMENTS: {'segments_parsed': 9}
+
+Non-numeric values in numeric columns:
+  - row 91 ROOF_POLYGON_VERIFY: [{'field': 'base_z_m_raw', 'value': 'varies'}, {'field': 'height_m_raw', 'value': 'varies'}, {'field': 'height_ft_raw', 'value': 'varies'}]
+
+Skipped rows:
+    2  no Element ID (section spacer)
+    1  Generate Geometry? = No
+
+Spawn record:
+  {'element_id': 'ZONE_SPAWN', 'x_grid': -10.6043320328266, 'y_grid': -1.5170187, 'x_m': -25.857603228844383, 'y_m': -3.69909839808, 'facing': 'South', 'row': 25}
+
+Forbidden building elements check:
+  hits in output JSON: 0
+  Forbidden building elements check: passed.
+
+Generated stair geometry: not created (import-only zones only).
+Generated reception/casework: not created.
+Exterior / site / parking / landscaping: not created.
+
+Scale sanity check:
+  1 grid = 2.4384 m  (locked).
+
+Done.
