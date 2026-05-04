@@ -41,6 +41,26 @@ from mathutils import Vector
 
 DEBUG_MODE = True  # First validation build: True. Set False for clean review.
 
+# --- Walkthrough realism toggles ----------------------------------------
+SHOW_REFERENCE_VOLUMES = False        # Hide large reference volumes by default.
+SHOW_CUTOUT_VOLUMES = False           # Hide ZONE_STAIRS / ZONE_HIGHBAY_VOID as solids.
+BUILD_FLOOR_PLATES = True             # Floor plates instead of full extrusions.
+BUILD_DERIVED_WALLS = True            # Perimeter walls around rooms / high-bay.
+APPLY_BOOLEAN_CUTOUTS = True          # Cut stair + high-bay void out of F2 slab.
+DELETE_BOOLEAN_CUTTERS_AFTER_APPLY = True  # Remove cutter meshes after Boolean.
+
+# Floor-plate thicknesses (m). F2 plate spans 3.09 -> 3.39 (=0.30 m thick).
+F1_FLOOR_THICKNESS = 0.08             # 0.05–0.10 m per spec.
+F2_FLOOR_THICKNESS = 0.30
+F2_SLAB_BASE_Z = 3.09
+F2_SLAB_TOP_Z = F2_SLAB_BASE_Z + F2_FLOOR_THICKNESS  # 3.39
+
+# Phase 0 fallback envelope used only when no F2 extents exist.
+DERIVED_F2_FALLBACK_GRID = (-15.0, -8.0, 5.0, 13.0)  # (x0, y0, x1, y1)
+DERIVED_F2_MARGIN_M = 0.25
+
+GRID_TO_M = 2.4384  # 1 grid square = 8 ft = 2.4384 m
+
 # If `nima_schedule.json` cannot be auto-discovered (common when running from
 # Blender's Text Editor), put the FULL absolute path to the JSON file here.
 # macOS example:
@@ -517,6 +537,151 @@ def make_label_empty(name, x, y, z, collection_name, label_text=None):
 
 
 # ---------------------------------------------------------------------------
+# Floor-plate / perimeter-wall / cutout primitives
+# ---------------------------------------------------------------------------
+
+def make_bbox_floor_plate(name, x0, y0, x1, y1, base_z, top_z,
+                          collection_name, material=None):
+    """Floor plate from an axis-aligned bbox occupying [base_z, top_z]."""
+    if None in (x0, y0, x1, y1, base_z, top_z) or top_z <= base_z:
+        return None
+    return make_box_minmax(name, x0, y0, x1, y1, base_z, top_z,
+                           collection_name, material)
+
+
+def make_polygon_floor_plate(name, polygon_xy, base_z, top_z,
+                             collection_name, material=None):
+    """Floor plate extruded from a 2D polygon between [base_z, top_z]."""
+    return make_polygon_extrusion(name, polygon_xy, base_z, top_z,
+                                  collection_name, material)
+
+
+def make_bbox_perimeter_walls(name_prefix, x0, y0, x1, y1, base_z, top_z,
+                              thickness, collection_name, material=None,
+                              skip_edges=None):
+    """Build wall segments along the four bbox edges as 3D solids.
+
+    skip_edges: set of {"N","S","E","W"} for edges to omit (e.g. open
+    loading side of a mezzanine).
+    """
+    if None in (x0, y0, x1, y1, base_z, top_z) or top_z <= base_z:
+        return []
+    skip = set(skip_edges or [])
+    if thickness is None or thickness <= 0:
+        thickness = DEFAULT_THK["wall"]
+    walls = []
+    edges = (
+        ("S", x0, y0, x1, y0),
+        ("N", x0, y1, x1, y1),
+        ("W", x0, y0, x0, y1),
+        ("E", x1, y0, x1, y1),
+    )
+    for label, ax, ay, bx, by in edges:
+        if label in skip:
+            continue
+        seg = make_segment_solid(
+            f"{name_prefix}_{label}", ax, ay, bx, by,
+            base_z, top_z, thickness, collection_name, material,
+        )
+        if seg is not None:
+            walls.append(seg)
+    return walls
+
+
+def make_polygon_perimeter_walls(name_prefix, polygon_xy, base_z, top_z,
+                                 thickness, collection_name, material=None,
+                                 skip_edge_indices=None):
+    """Build wall segments along each polygon edge."""
+    if not polygon_xy or len(polygon_xy) < 3:
+        return []
+    if None in (base_z, top_z) or top_z <= base_z:
+        return []
+    if thickness is None or thickness <= 0:
+        thickness = DEFAULT_THK["wall"]
+    skip = set(skip_edge_indices or [])
+    walls = []
+    n = len(polygon_xy)
+    for i in range(n):
+        if i in skip:
+            continue
+        a = polygon_xy[i]
+        b = polygon_xy[(i + 1) % n]
+        seg = make_segment_solid(
+            f"{name_prefix}_E{i:02d}",
+            a[0], a[1], b[0], b[1],
+            base_z, top_z, thickness, collection_name, material,
+        )
+        if seg is not None:
+            walls.append(seg)
+    return walls
+
+
+def make_cutter_box(name, x0, y0, x1, y1, base_z, top_z, padding=0.05):
+    """Hidden, slightly oversized box used as a Boolean DIFFERENCE cutter."""
+    if None in (x0, y0, x1, y1, base_z, top_z):
+        return None
+    cutter = make_box_minmax(
+        name, x0, y0, x1, y1,
+        base_z - padding, top_z + padding,
+        "NIMA_Debug_Reference", None,
+    )
+    if cutter is not None:
+        cutter.hide_render = True
+        cutter.display_type = "BOUNDS"
+    return cutter
+
+
+def apply_boolean_difference(target_obj, cutter_obj, log):
+    """Apply a Boolean DIFFERENCE modifier from cutter_obj to target_obj.
+    Returns True on success."""
+    if target_obj is None or cutter_obj is None:
+        return False
+    try:
+        if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+    except Exception:
+        pass
+    try:
+        bpy.ops.object.select_all(action="DESELECT")
+    except Exception:
+        pass
+    target_obj.select_set(True)
+    bpy.context.view_layer.objects.active = target_obj
+    mod_name = (f"BOOL_{cutter_obj.name}")[:60]
+    mod = target_obj.modifiers.new(name=mod_name, type="BOOLEAN")
+    mod.operation = "DIFFERENCE"
+    mod.object = cutter_obj
+    try:
+        if hasattr(mod, "solver"):
+            mod.solver = "FAST"
+    except Exception:
+        pass
+    try:
+        bpy.ops.object.modifier_apply(modifier=mod_name)
+        log["boolean_applied"].append({
+            "target": target_obj.name, "cutter": cutter_obj.name,
+        })
+        return True
+    except Exception as e:
+        try:
+            target_obj.modifiers.remove(mod)
+        except Exception:
+            pass
+        log["boolean_failed"].append({
+            "target": target_obj.name, "cutter": cutter_obj.name,
+            "error": str(e),
+        })
+        return False
+
+
+def _bbox_overlap(a, b):
+    """Return True if two (x0,y0,x1,y1) bboxes overlap in XY."""
+    if a is None or b is None:
+        return False
+    return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+
+# ---------------------------------------------------------------------------
 # Per-row dispatch
 # ---------------------------------------------------------------------------
 
@@ -748,13 +913,17 @@ def _build_segment_list(row, log):
         return _build_label(row, log, reason="segment list empty after parsing")
 
     d = row["dims"]
-    base_z = safe_float(d.get("base_z_m")) or 0.0
+    floor = (row.get("floor") or "")
+    base_z = safe_float(d.get("base_z_m"))
+    if base_z is None:
+        # Use F2 slab top as the sill default for F2 rows; floor for F1.
+        base_z = F2_SLAB_TOP_Z if "F2" in floor else 0.0
     top_z = safe_float(d.get("top_z_m"))
     height_m = safe_float(d.get("height_m"))
     if top_z is None and height_m is not None:
         top_z = base_z + height_m
     if top_z is None or top_z <= base_z:
-        # Default to F1 ceiling height as a reference window strip.
+        # Default to room-height reference glass strip.
         top_z = base_z + 3.05
     thickness = safe_float(d.get("thickness_m")) or DEFAULT_THK["glass"]
     placeholder = row.get("material_placeholder") or "MAT_Glass_ClearArchitectural"
@@ -854,11 +1023,620 @@ def _build_spawn(spawn, log):
     })
 
 
-def _build_one(row, all_rows, log):
-    eid = row.get("element_id")
-    gtype = (row.get("geometry_type") or "").lower()
-    ptype = (row.get("placement") or "").lower()
+# ---------------------------------------------------------------------------
+# Element-ID -> role classification
+# ---------------------------------------------------------------------------
 
+ELEMENT_ROLES = {
+    # Walkable F1 floor plates (no walls).
+    "ZONE_LOBBY_CTX":              "f1_floor_only",
+    "ZONE_CONNECTOR_PATH":         "f1_floor_only",
+    "ZONE_OFFICELAB_TRANS":        "f1_floor_only",
+
+    # F2 cutouts — never solid; used as Boolean cutters.
+    "ZONE_STAIRS":                 "cutout_f2",
+    "ZONE_HIGHBAY_VOID":           "cutout_f2",
+
+    # High-bay = concrete floor + tall industrial perimeter walls.
+    "ZONE_HIGHBAY":                "highbay_floor_walls",
+
+    # F2 edge / overlook geometry.
+    "ZONE_HIGHBAY_OVERLOOK":       "f2_edge_outline",
+    "ZONE_F2_OVERLOOK_POLYGON_VERIFIED": "f2_overlook_polygon_floor",
+
+    # F2 mezzanine = bbox floor + walls (open loading side from notes).
+    "ZONE_MEZZ":                   "f2_room_with_walls",
+
+    # GRND/RECYC + Pallet stack:
+    #  - ZONE_GRND_RECYC: F1 polygon floor only (full cage walls come from
+    #    ELEM_GRND_RECYC_CAGE which spans 0–5.99 m).
+    #  - ZONE_PALLET: F2 polygon floor only (cage walls from same row above).
+    "ZONE_GRND_RECYC":             "f1_polygon_floor_only",
+    "ZONE_PALLET":                 "f2_polygon_floor_only",
+    "ELEM_GRND_RECYC_CAGE":        "polygon_perimeter_walls",
+    "ELEM_PALLET_FLOOR_PLATE":     "polygon_floor_plate_explicit",
+
+    # Spawn (built before main pass).
+    "ZONE_SPAWN":                  "spawn_already_built",
+
+    # F2 slab seed — no footprint; envelope handled in post-pass.
+    "SLAB_F2_CENTRAL":             "f2_slab_envelope_seed",
+
+    # F2 overlook glass perimeter — per-edge with SW->NW skip rule.
+    "ELEM_F2_GLASS_PERIMETER_WALL": "f2_overlook_glass_per_edge",
+
+    # Edge / rail elements: thin perimeter solids.
+    "ELEM_RAIL_HB_OVERLOOK":       "edge_rail_bbox",
+    "ELEM_RAIL_STAIR_VOID":        "edge_rail_bbox",
+    "ELEM_OPEN_TO_BELOW_EDGE":     "edge_rail_bbox",
+
+    # Door-style box markers.
+    "ELEM_MEZZ_LOADING_GATE":      "door_panel",
+    "ELEM_SHORT_DOOR_F2_SW":       "door_panel",
+    "ELEM_ENTRY_GLASS_PROXY":      "door_panel",
+    "ELEM_OVERHEAD_VERIFY":        "door_panel",
+
+    # Equipment proxy / arrow / labels.
+    "ELEM_HIGHBAY_EQUIP_PROXY":    "label",
+    "ELEM_SPAWN_ARROW":            "label",
+    "ELEM_NONWORKING_DOOR_LABELS": "label",
+
+    # Roof / closure references.
+    "ROOF_POLYGON_VERIFY":         "roof_outline",
+    "ROOF_HIGHBAY_TOP_REF":        "height_post",
+    "ROOF_LOBBY_CONN_TOP_REF":     "height_post",
+    "ROOF_STRUCT_ABOVE_HB":        "roof_reference_volume",
+    "ROOF_PARAPET_EDGE":           "roof_parapet_edge",
+
+    # Section 01 debug overlays.
+    "RULE_OUTER":                  "debug_overlay",
+    "RULE_INNER":                  "debug_overlay",
+    "RULE_ROTATION":               "debug_overlay",
+
+    # Section 02 height posts.
+    "HT_F1_LOWER":                 "height_post",
+    "HT_F2_TOP":                   "height_post",
+    "HT_F2_OCCUPIED":              "height_post",
+    "HT_HIGHBAY":                  "height_post",
+    "HT_ROOF_REF":                 "height_post",
+
+    # Section 09 segment lists / windows.
+    "F1_GLASS_CW_SEGMENTS":        "segment_list",
+    "F1_WINDOWS_HB_EAST_NORTH":    "window_markers",
+    "F2_GLASS_CW_SEGMENTS":        "segment_list",
+}
+
+
+def _classify_role(row):
+    eid = row.get("element_id") or ""
+    role = ELEMENT_ROLES.get(eid)
+    if role is not None:
+        return role
+    if eid.startswith("D_F1_") or eid.startswith("D_F2_"):
+        return "door_panel"
+    gtype = (row.get("geometry_type") or "").lower()
+    if "door/panel" in gtype or "door marker" in gtype:
+        return "door_panel"
+    if gtype.startswith("segment list"):
+        return "segment_list"
+    if "window marker" in gtype:
+        return "window_markers"
+    if gtype == "height post":
+        return "height_post"
+    return "label"
+
+
+# ---------------------------------------------------------------------------
+# Role handlers
+# ---------------------------------------------------------------------------
+
+def _role_f1_floor_only(row, ctx, log):
+    eid = row["element_id"]
+    dm = row["dims_m_from_grid"]
+    x0, y0 = dm.get("min_x_m"), dm.get("min_y_m")
+    x1, y1 = dm.get("max_x_m"), dm.get("max_y_m")
+    if None in (x0, y0, x1, y1):
+        return _role_label(row, ctx, log, reason="F1 floor: bbox missing")
+    base_z = safe_float(row["dims"].get("base_z_m")) or 0.0
+    top_z = base_z + F1_FLOOR_THICKNESS
+    mat = _resolve_material(row, log)
+    obj = make_bbox_floor_plate(
+        safe_object_name("FLOOR", eid), x0, y0, x1, y1,
+        base_z, top_z, row["collection_target"], mat,
+    )
+    if obj is not None:
+        log["floor_plates"].append({
+            "row": row["row"], "element_id": eid,
+            "kind": "f1_bbox", "name": obj.name,
+        })
+
+
+def _role_f1_polygon_floor_only(row, ctx, log):
+    eid = row["element_id"]
+    poly = row.get("polygon_m")
+    if not poly or len(poly) < 3:
+        return _role_label(row, ctx, log, reason="F1 polygon floor: no polygon")
+    base_z = safe_float(row["dims"].get("base_z_m")) or 0.0
+    top_z = base_z + F1_FLOOR_THICKNESS
+    mat = _resolve_material(row, log)
+    obj = make_polygon_floor_plate(
+        safe_object_name("FLOOR", eid), poly, base_z, top_z,
+        row["collection_target"], mat,
+    )
+    if obj is not None:
+        log["floor_plates"].append({
+            "row": row["row"], "element_id": eid,
+            "kind": "f1_polygon", "name": obj.name,
+        })
+
+
+def _role_f2_polygon_floor_only(row, ctx, log):
+    eid = row["element_id"]
+    poly = row.get("polygon_m")
+    if not poly or len(poly) < 3:
+        return _role_label(row, ctx, log, reason="F2 polygon floor: no polygon")
+    mat = _resolve_material(row, log)
+    obj = make_polygon_floor_plate(
+        safe_object_name("FLOOR", eid), poly, F2_SLAB_BASE_Z, F2_SLAB_TOP_Z,
+        row["collection_target"], mat,
+    )
+    if obj is not None:
+        log["floor_plates"].append({
+            "row": row["row"], "element_id": eid,
+            "kind": "f2_polygon", "name": obj.name,
+        })
+        ctx["f2_floor_plates"].append(obj)
+
+
+def _role_f2_overlook_polygon_floor(row, ctx, log):
+    """F2 overlook = polygon-shaped floor plate at 3.09–3.39 m only.
+    Glass perimeter is built separately via ELEM_F2_GLASS_PERIMETER_WALL."""
+    eid = row["element_id"]
+    poly = row.get("polygon_m")
+    if not poly or len(poly) < 3:
+        return _role_label(row, ctx, log, reason="overlook: no polygon")
+    mat = _ensure("MAT_Floor_TanCeramicTile")
+    obj = make_polygon_floor_plate(
+        safe_object_name("OVERLOOK_FLOOR", eid), poly,
+        F2_SLAB_BASE_Z, F2_SLAB_TOP_Z,
+        row["collection_target"], mat,
+    )
+    if obj is not None:
+        log["floor_plates"].append({
+            "row": row["row"], "element_id": eid,
+            "kind": "f2_overlook_polygon", "name": obj.name,
+        })
+        ctx["f2_floor_plates"].append(obj)
+
+
+def _role_f2_room_with_walls(row, ctx, log):
+    """ZONE_MEZZ: bbox floor + perimeter walls. Notes-driven open side detection."""
+    eid = row["element_id"]
+    d = row["dims"]
+    dm = row["dims_m_from_grid"]
+    x0, y0 = dm.get("min_x_m"), dm.get("min_y_m")
+    x1, y1 = dm.get("max_x_m"), dm.get("max_y_m")
+    if None in (x0, y0, x1, y1):
+        return _role_label(row, ctx, log, reason="room: bbox missing")
+    row_base_z = safe_float(d.get("base_z_m")) or F2_SLAB_BASE_Z
+    row_top_z = safe_float(d.get("top_z_m")) or (row_base_z + 2.9)
+
+    # Floor plate.
+    floor_top = row_base_z + F2_FLOOR_THICKNESS
+    floor_mat = _ensure("MAT_Floor_TanCeramicTile")
+    floor_obj = make_bbox_floor_plate(
+        safe_object_name("FLOOR", eid), x0, y0, x1, y1,
+        row_base_z, floor_top, row["collection_target"], floor_mat,
+    )
+    if floor_obj is not None:
+        log["floor_plates"].append({
+            "row": row["row"], "element_id": eid,
+            "kind": "f2_room_bbox", "name": floor_obj.name,
+        })
+        ctx["f2_floor_plates"].append(floor_obj)
+
+    if not BUILD_DERIVED_WALLS:
+        return
+
+    # Detect open loading side from notes (e.g. ZONE_MEZZ NE↔SE = max-X / east).
+    notes_low = (row.get("notes") or "").lower()
+    skip_edges = set()
+    if "no wall between the ne and se" in notes_low \
+            or "fork-truck loading" in notes_low \
+            or "fork truck loading" in notes_low:
+        skip_edges.add("E")
+        log["mezz_open_side_skipped"] = "E"
+
+    wall_thk = safe_float(d.get("thickness_m")) or DEFAULT_THK["wall"]
+    wall_mat = _ensure("MAT_Wall_WarmCreamPaint")
+    walls = make_bbox_perimeter_walls(
+        safe_object_name("WALL", eid), x0, y0, x1, y1,
+        floor_top, row_top_z, wall_thk,
+        row["collection_target"], wall_mat,
+        skip_edges=skip_edges,
+    )
+    log["perimeter_walls"].append({
+        "row": row["row"], "element_id": eid,
+        "kind": "bbox_room",
+        "n_segments_built": len(walls),
+        "skipped_edges": sorted(list(skip_edges)),
+    })
+
+
+def _role_highbay(row, ctx, log):
+    """ZONE_HIGHBAY: concrete floor at Z=0 + tall industrial perimeter walls."""
+    eid = row["element_id"]
+    d = row["dims"]
+    dm = row["dims_m_from_grid"]
+    x0, y0 = dm.get("min_x_m"), dm.get("min_y_m")
+    x1, y1 = dm.get("max_x_m"), dm.get("max_y_m")
+    if None in (x0, y0, x1, y1):
+        return _role_label(row, ctx, log, reason="highbay: bbox missing")
+    base_z = safe_float(d.get("base_z_m")) or 0.0
+    top_z = safe_float(d.get("top_z_m")) or 10.31
+
+    # Concrete floor.
+    floor_top = base_z + 0.10
+    floor_mat = _ensure("MAT_HighBay_ConcreteSlab")
+    floor_obj = make_bbox_floor_plate(
+        safe_object_name("FLOOR", eid), x0, y0, x1, y1,
+        base_z, floor_top, row["collection_target"], floor_mat,
+    )
+    if floor_obj is not None:
+        log["floor_plates"].append({
+            "row": row["row"], "element_id": eid,
+            "kind": "highbay_concrete", "name": floor_obj.name,
+        })
+
+    if BUILD_DERIVED_WALLS:
+        wall_thk = 0.25  # high-bay walls are heftier
+        wall_mat = _ensure("MAT_HighBay_SolidIndustrialWall")
+        walls = make_bbox_perimeter_walls(
+            safe_object_name("WALL", eid), x0, y0, x1, y1,
+            floor_top, top_z, wall_thk,
+            row["collection_target"], wall_mat,
+        )
+        log["perimeter_walls"].append({
+            "row": row["row"], "element_id": eid,
+            "kind": "highbay_industrial",
+            "n_segments_built": len(walls),
+        })
+
+    if SHOW_REFERENCE_VOLUMES:
+        ref_mat = _ensure("MAT_Debug_Reference")
+        make_box_minmax(
+            safe_object_name("VOL", eid), x0, y0, x1, y1,
+            floor_top, top_z, "NIMA_Debug_Reference", ref_mat,
+        )
+        log["reference_volumes_built"].append({
+            "row": row["row"], "element_id": eid,
+            "kind": "highbay_translucent_volume",
+        })
+
+
+def _role_cutout_f2(row, ctx, log):
+    """ZONE_STAIRS / ZONE_HIGHBAY_VOID: build hidden Boolean cutter + outline.
+    Never produces a solid exportable box for the cutout itself."""
+    eid = row["element_id"]
+    dm = row["dims_m_from_grid"]
+    x0, y0 = dm.get("min_x_m"), dm.get("min_y_m")
+    x1, y1 = dm.get("max_x_m"), dm.get("max_y_m")
+    if None in (x0, y0, x1, y1):
+        log["cutouts_skipped"].append({
+            "row": row["row"], "element_id": eid, "reason": "bbox missing",
+        })
+        return
+
+    cutter_name = safe_object_name("_CUTTER", eid)
+    cutter = make_cutter_box(
+        cutter_name, x0, y0, x1, y1,
+        F2_SLAB_BASE_Z, F2_SLAB_TOP_Z, padding=0.05,
+    )
+    if cutter is None:
+        log["cutouts_skipped"].append({
+            "row": row["row"], "element_id": eid,
+            "reason": "cutter creation failed",
+        })
+        return
+
+    ctx["cutters"].append({
+        "row": row["row"], "element_id": eid, "obj": cutter,
+        "bbox_m": (x0, y0, x1, y1),
+    })
+    log["cutouts_recorded"].append({
+        "row": row["row"], "element_id": eid,
+        "bbox_m": (x0, y0, x1, y1),
+    })
+
+    if SHOW_CUTOUT_VOLUMES:
+        # Optional debug preview (translucent) so the user can see the void.
+        debug_mat = _ensure("MAT_Debug_OpenToBelow")
+        d_top = safe_float(row["dims"].get("top_z_m")) or F2_SLAB_TOP_Z
+        d_base = safe_float(row["dims"].get("base_z_m")) or F2_SLAB_BASE_Z
+        preview = make_box_minmax(
+            safe_object_name("CUTOUT_PREVIEW", eid),
+            x0, y0, x1, y1, d_base, d_top,
+            "NIMA_Debug_Reference", debug_mat,
+        )
+        if preview is not None:
+            preview.hide_render = True  # debug only — never export
+            log["cutout_previews"].append({"element_id": eid,
+                                           "name": preview.name})
+    else:
+        # Thin outline so the hole is legible after Boolean cuts the slab.
+        outline_mat = _ensure("MAT_Debug_OpenToBelow")
+        edge_z = F2_SLAB_TOP_Z + 0.001
+        edge_h = 0.05
+        outline = make_bbox_perimeter_walls(
+            safe_object_name("CUTOUT_OUTLINE", eid),
+            x0, y0, x1, y1,
+            edge_z - edge_h * 0.5, edge_z + edge_h * 0.5,
+            0.04, "NIMA_Debug_Reference", outline_mat,
+        )
+        log["cutout_outlines"].append({
+            "element_id": eid, "n_edges": len(outline),
+        })
+
+
+def _role_f2_edge_outline(row, ctx, log):
+    """ZONE_HIGHBAY_OVERLOOK: thin perimeter outline at F2 slab top, no solid."""
+    eid = row["element_id"]
+    dm = row["dims_m_from_grid"]
+    x0, y0 = dm.get("min_x_m"), dm.get("min_y_m")
+    x1, y1 = dm.get("max_x_m"), dm.get("max_y_m")
+    if None in (x0, y0, x1, y1):
+        return _role_label(row, ctx, log, reason="edge outline: bbox missing")
+    z = F2_SLAB_TOP_Z
+    edge_h = 0.04
+    mat = _ensure("MAT_Debug_Reference")
+    walls = make_bbox_perimeter_walls(
+        safe_object_name("EDGE", eid), x0, y0, x1, y1,
+        z - edge_h * 0.5, z + edge_h * 0.5,
+        0.04, row["collection_target"], mat,
+    )
+    log["edge_outlines"].append({
+        "row": row["row"], "element_id": eid, "n_edges": len(walls),
+    })
+
+
+def _role_edge_rail_bbox(row, ctx, log):
+    """Thin perimeter rail/edge solid using row Base/Top Z."""
+    eid = row["element_id"]
+    d = row["dims"]
+    dm = row["dims_m_from_grid"]
+    x0, y0 = dm.get("min_x_m"), dm.get("min_y_m")
+    x1, y1 = dm.get("max_x_m"), dm.get("max_y_m")
+    if None in (x0, y0, x1, y1):
+        return _role_label(row, ctx, log, reason="rail: bbox missing")
+    base_z = safe_float(d.get("base_z_m")) or F2_SLAB_TOP_Z
+    top_z = safe_float(d.get("top_z_m")) or (base_z + 1.1)
+    thk = safe_float(d.get("thickness_m")) or DEFAULT_THK["rail"]
+    mat = _ensure("MAT_Handrail_BlackPaintedMetal")
+    walls = make_bbox_perimeter_walls(
+        safe_object_name("RAIL", eid), x0, y0, x1, y1,
+        base_z, top_z, thk, row["collection_target"], mat,
+    )
+    log["edge_rails"].append({
+        "row": row["row"], "element_id": eid, "n_segments": len(walls),
+    })
+
+
+def _role_polygon_perimeter_walls(row, ctx, log):
+    """ELEM_GRND_RECYC_CAGE: full-height polygon cage walls."""
+    eid = row["element_id"]
+    poly = row.get("polygon_m")
+    if not poly or len(poly) < 3:
+        return _role_label(row, ctx, log, reason="cage: no polygon")
+    d = row["dims"]
+    base_z = safe_float(d.get("base_z_m")) or 0.0
+    top_z = safe_float(d.get("top_z_m"))
+    if top_z is None or top_z <= base_z:
+        top_z = 5.99
+    thk = safe_float(d.get("thickness_m")) or DEFAULT_THK["rail"]
+    mat = _resolve_material(row, log)
+    walls = make_polygon_perimeter_walls(
+        safe_object_name("CAGE", eid), poly, base_z, top_z, thk,
+        row["collection_target"], mat,
+    )
+    log["perimeter_walls"].append({
+        "row": row["row"], "element_id": eid,
+        "kind": "polygon_cage", "n_segments_built": len(walls),
+    })
+
+
+def _role_polygon_floor_plate_explicit(row, ctx, log):
+    """ELEM_PALLET_FLOOR_PLATE: polygon-shaped plate at row Base/Top Z."""
+    eid = row["element_id"]
+    poly = row.get("polygon_m")
+    if not poly or len(poly) < 3:
+        return _role_label(row, ctx, log, reason="plate: no polygon")
+    d = row["dims"]
+    base_z = safe_float(d.get("base_z_m"))
+    top_z = safe_float(d.get("top_z_m"))
+    if base_z is None or top_z is None:
+        return _role_label(row, ctx, log, reason="plate: missing Base/Top Z")
+    mat = _resolve_material(row, log)
+    obj = make_polygon_floor_plate(
+        safe_object_name("PLATE", eid), poly, base_z, top_z,
+        row["collection_target"], mat,
+    )
+    if obj is not None:
+        log["floor_plates"].append({
+            "row": row["row"], "element_id": eid,
+            "kind": "polygon_plate", "name": obj.name,
+        })
+
+
+def _role_door_panel(row, ctx, log):
+    obj = _build_door_panel(row, log)
+    if obj is not None:
+        log["doors"].append({
+            "row": row["row"], "element_id": row["element_id"],
+            "name": obj.name,
+        })
+    else:
+        _role_label(row, ctx, log, reason="door dims unsafe")
+
+
+def _role_label(row, ctx, log, reason="label fallback"):
+    _build_label(row, log, reason=reason)
+
+
+def _role_f2_overlook_glass_per_edge(row, ctx, log):
+    _build_f2_overlook_glass(row, list(ctx["rows_by_eid"].values()), log)
+
+
+def _role_f2_slab_envelope_seed(row, ctx, log):
+    log["f2_slab_envelope_seeds"].append({
+        "row": row["row"], "element_id": row["element_id"],
+        "note": "footprint missing; DERIVED_F2_SLAB_ENVELOPE handles slab",
+    })
+
+
+def _role_roof_outline(row, ctx, log):
+    eid = row["element_id"]
+    poly = row.get("polygon_m")
+    if not poly or len(poly) < 3:
+        return _role_label(row, ctx, log, reason="roof: no polygon")
+    top_z = safe_float(row["dims"].get("top_z_m")) or 11.91
+    mat = _ensure("MAT_Roof_StructurePlaceholder")
+    if SHOW_REFERENCE_VOLUMES:
+        obj = make_polygon_floor_plate(
+            safe_object_name("ROOF", eid), poly, top_z - 0.10, top_z,
+            row["collection_target"], mat,
+        )
+        log["roof_outlines"].append({
+            "element_id": eid, "kind": "filled",
+            "name": obj.name if obj is not None else None,
+        })
+    else:
+        edge_h = 0.05
+        walls = make_polygon_perimeter_walls(
+            safe_object_name("ROOF_EDGE", eid), poly,
+            top_z - edge_h * 0.5, top_z + edge_h * 0.5,
+            0.06, row["collection_target"], mat,
+        )
+        log["roof_outlines"].append({
+            "element_id": eid, "kind": "perimeter",
+            "n_segments_built": len(walls),
+        })
+
+
+def _role_roof_parapet_edge(row, ctx, log):
+    eid = row["element_id"]
+    roof_row = ctx["rows_by_eid"].get("ROOF_POLYGON_VERIFY")
+    poly = roof_row.get("polygon_m") if roof_row else None
+    if not poly or len(poly) < 3:
+        return _role_label(row, ctx, log,
+                           reason="parapet: ROOF_POLYGON_VERIFY polygon missing")
+    base_z = safe_float(row["dims"].get("base_z_m")) or 11.91
+    top_z = safe_float(row["dims"].get("top_z_m")) or 12.37
+    thk = safe_float(row["dims"].get("thickness_m")) or 0.254
+    mat = _ensure("MAT_Roof_StructurePlaceholder")
+    walls = make_polygon_perimeter_walls(
+        safe_object_name("PARAPET", eid), poly, base_z, top_z, thk,
+        row["collection_target"], mat,
+    )
+    log["parapet_edges"].append({
+        "row": row["row"], "element_id": eid, "n_segments_built": len(walls),
+    })
+
+
+def _role_roof_reference_volume(row, ctx, log):
+    if not SHOW_REFERENCE_VOLUMES:
+        log["reference_volumes_skipped"].append({
+            "row": row["row"], "element_id": row["element_id"],
+        })
+        return
+    eid = row["element_id"]
+    hb_row = ctx["rows_by_eid"].get("ZONE_HIGHBAY")
+    if not hb_row:
+        return _role_label(row, ctx, log, reason="ref vol: no HB ref")
+    dm = hb_row["dims_m_from_grid"]
+    x0, y0 = dm.get("min_x_m"), dm.get("min_y_m")
+    x1, y1 = dm.get("max_x_m"), dm.get("max_y_m")
+    if None in (x0, y0, x1, y1):
+        return _role_label(row, ctx, log, reason="ref vol: HB bbox missing")
+    base_z = safe_float(row["dims"].get("base_z_m")) or 10.31
+    top_z = safe_float(row["dims"].get("top_z_m")) or 11.91
+    mat = _ensure("MAT_Roof_StructurePlaceholder")
+    obj = make_box_minmax(
+        safe_object_name("REF_VOL", eid), x0, y0, x1, y1,
+        base_z, top_z, "NIMA_Debug_Reference", mat,
+    )
+    if obj is not None:
+        log["reference_volumes_built"].append({
+            "row": row["row"], "element_id": eid, "name": obj.name,
+        })
+
+
+def _role_height_post(row, ctx, log):
+    if not DEBUG_MODE:
+        log["skipped"].append({
+            "row": row["row"], "element_id": row["element_id"],
+            "reason": "Height Post is debug-only and DEBUG_MODE=False",
+        })
+        return
+    obj = _build_height_post(row, log)
+    if obj is not None:
+        log["objects_created"].append({
+            "row": row["row"], "element_id": row["element_id"],
+            "kind": "height_post",
+        })
+
+
+def _role_debug_overlay(row, ctx, log):
+    if not DEBUG_MODE:
+        return
+    obj = _build_box_or_marker(row, log)
+    if obj is not None:
+        log["objects_created"].append({
+            "row": row["row"], "element_id": row["element_id"],
+            "kind": "debug_overlay",
+        })
+
+
+def _role_segment_list(row, ctx, log):
+    _build_segment_list(row, log)
+
+
+def _role_window_markers(row, ctx, log):
+    _build_window_markers(row, log)
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
+ROLE_HANDLERS = {
+    "f1_floor_only":             _role_f1_floor_only,
+    "f1_polygon_floor_only":     _role_f1_polygon_floor_only,
+    "f2_polygon_floor_only":     _role_f2_polygon_floor_only,
+    "f2_overlook_polygon_floor": _role_f2_overlook_polygon_floor,
+    "f2_room_with_walls":        _role_f2_room_with_walls,
+    "highbay_floor_walls":       _role_highbay,
+    "cutout_f2":                 _role_cutout_f2,
+    "f2_edge_outline":           _role_f2_edge_outline,
+    "edge_rail_bbox":            _role_edge_rail_bbox,
+    "polygon_perimeter_walls":   _role_polygon_perimeter_walls,
+    "polygon_floor_plate_explicit": _role_polygon_floor_plate_explicit,
+    "door_panel":                _role_door_panel,
+    "label":                     _role_label,
+    "f2_overlook_glass_per_edge": _role_f2_overlook_glass_per_edge,
+    "f2_slab_envelope_seed":     _role_f2_slab_envelope_seed,
+    "roof_outline":              _role_roof_outline,
+    "roof_parapet_edge":         _role_roof_parapet_edge,
+    "roof_reference_volume":     _role_roof_reference_volume,
+    "height_post":               _role_height_post,
+    "debug_overlay":             _role_debug_overlay,
+    "segment_list":              _role_segment_list,
+    "window_markers":            _role_window_markers,
+    "spawn_already_built":       lambda r, c, l: None,
+}
+
+
+def _build_one(row, ctx, log):
+    eid = row.get("element_id")
     should_build, _ = _generate_decision(row, log)
     if not should_build:
         log["skipped"].append({
@@ -866,188 +1644,116 @@ def _build_one(row, all_rows, log):
             "reason": f"Generate={row.get('generate')!r}, DEBUG_MODE={DEBUG_MODE}",
         })
         return
+    role = _classify_role(row)
+    handler = ROLE_HANDLERS.get(role, _role_label)
+    handler(row, ctx, log)
 
-    # --- Special case 1: Spawn -----------------------------------------------
-    if eid == "ZONE_SPAWN":
-        # Handled by _build_spawn separately (called once); skip here so we
-        # don't double-build.
-        return
 
-    # --- Special case 2: F2 overlook glass perimeter (per-edge w/ open rule) -
-    if eid == F2_OVERLOOK_GLASS_EID:
-        _build_f2_overlook_glass(row, all_rows, log)
-        return
+# ---------------------------------------------------------------------------
+# Derived F2 slab envelope and Boolean post-pass
+# ---------------------------------------------------------------------------
 
-    # --- Polygon zones -------------------------------------------------------
-    polygon_keywords = (
-        "polygon", "rotated rectangle", "verified corners",
-        "16 unique vertices", "4 user-confirmed", "4 verified",
+def _gather_f2_extents(rows):
+    """Return list of (x0,y0,x1,y1) bboxes in meters for F2-related rows."""
+    extents = []
+    for r in rows:
+        floor = r.get("floor") or ""
+        eid = r.get("element_id") or ""
+        # Include any F2 / F2/HB / Between F1-F2 / mezz / pallet / overlook /
+        # void / stairs row that has either a bbox or a polygon.
+        wants_inclusion = (
+            "F2" in floor
+            or eid in {"ZONE_STAIRS", "ZONE_HIGHBAY_VOID", "SLAB_F2_CENTRAL",
+                       "ELEM_PALLET_FLOOR_PLATE"}
+        )
+        if not wants_inclusion:
+            continue
+        dm = r["dims_m_from_grid"]
+        x0, y0 = dm.get("min_x_m"), dm.get("min_y_m")
+        x1, y1 = dm.get("max_x_m"), dm.get("max_y_m")
+        if None not in (x0, y0, x1, y1):
+            extents.append((x0, y0, x1, y1))
+        poly = r.get("polygon_m")
+        if poly and len(poly) >= 3:
+            xs = [p[0] for p in poly]
+            ys = [p[1] for p in poly]
+            extents.append((min(xs), min(ys), max(xs), max(ys)))
+    return extents
+
+
+def _build_derived_f2_envelope(rows, ctx, log):
+    if not BUILD_FLOOR_PLATES:
+        log["derived_f2_slab"] = {"built": False,
+                                  "reason": "BUILD_FLOOR_PLATES=False"}
+        return None
+
+    extents = _gather_f2_extents(rows)
+    used_fallback = False
+    if extents:
+        x0 = min(e[0] for e in extents) - DERIVED_F2_MARGIN_M
+        y0 = min(e[1] for e in extents) - DERIVED_F2_MARGIN_M
+        x1 = max(e[2] for e in extents) + DERIVED_F2_MARGIN_M
+        y1 = max(e[3] for e in extents) + DERIVED_F2_MARGIN_M
+    else:
+        used_fallback = True
+        gx0, gy0, gx1, gy1 = DERIVED_F2_FALLBACK_GRID
+        x0 = gx0 * GRID_TO_M
+        y0 = gy0 * GRID_TO_M
+        x1 = gx1 * GRID_TO_M
+        y1 = gy1 * GRID_TO_M
+
+    mat = _ensure("MAT_Slab_ConcretePlaceholder")
+    name = "DERIVED_F2_SLAB_ENVELOPE"
+    obj = make_bbox_floor_plate(
+        name, x0, y0, x1, y1,
+        F2_SLAB_BASE_Z, F2_SLAB_TOP_Z, "NIMA_F2", mat,
     )
-    if any(k in gtype for k in polygon_keywords) or row.get("polygon_m"):
-        obj = _build_polygon_zone(row, log)
-        if obj is not None:
-            log["objects_created"].append({
-                "row": row["row"], "element_id": eid, "kind": "polygon_zone",
-            })
-        return
-
-    # --- Door / panel / overhead door markers --------------------------------
-    if "door/panel" in gtype or "door marker" in gtype \
-            or gtype.startswith("glass door") \
-            or gtype.startswith("wide panel"):
-        obj = _build_door_panel(row, log)
-        if obj is not None:
-            log["objects_created"].append({
-                "row": row["row"], "element_id": eid, "kind": "door_panel",
-            })
-        else:
-            _build_label(row, log, reason="door dims unsafe")
-        return
-
-    # --- Glass wall / glass entry proxy --------------------------------------
-    if "glass wall" in gtype or "glass curtain" in gtype:
-        # General path; F2 overlook glass already handled above.
-        obj = _build_box_or_marker(row, log)
-        if obj is None:
-            _build_label(row, log, reason="glass wall dims unsafe")
-        else:
-            log["objects_created"].append({
-                "row": row["row"], "element_id": eid, "kind": "glass_wall",
-            })
-        return
-
-    # --- Segment list / window markers ---------------------------------------
-    if gtype.startswith("segment list"):
-        _build_segment_list(row, log)
-        return
-    if "window marker" in gtype:
-        _build_window_markers(row, log)
-        return
-
-    # --- Height posts --------------------------------------------------------
-    if gtype == "height post":
-        if not DEBUG_MODE:
-            log["skipped"].append({
-                "row": row["row"], "element_id": eid,
-                "reason": "Height Post is debug-only and DEBUG_MODE=False",
-            })
-            return
-        obj = _build_height_post(row, log)
-        if obj is not None:
-            log["objects_created"].append({
-                "row": row["row"], "element_id": eid, "kind": "height_post",
-            })
-        return
-
-    # --- Slab / reference plane ----------------------------------------------
-    if gtype == "slab reference" or gtype == "reference plane":
-        d = row["dims"]
-        dm = row["dims_m_from_grid"]
-        x0 = dm.get("min_x_m"); x1 = dm.get("max_x_m")
-        y0 = dm.get("min_y_m"); y1 = dm.get("max_y_m")
-        top_z = safe_float(d.get("top_z_m"))
-        thk = safe_float(d.get("thickness_m")) or DEFAULT_THK["debug_plane"]
-        if None in (x0, x1, y0, y1, top_z):
-            _build_label(row, log, reason="slab dims unsafe")
-            return
-        mat = _resolve_material(row, log)
-        name = safe_object_name("SLAB", eid)
-        make_box_minmax(name, x0, y0, x1, y1, top_z - thk, top_z,
-                        row["collection_target"], mat)
-        log["objects_created"].append({
-            "row": row["row"], "element_id": eid, "kind": "slab_reference",
-        })
-        return
-
-    # --- Transparent void marker (massing volume) ----------------------------
-    if "transparent" in gtype or gtype == "volume":
-        obj = _build_box_or_marker(row, log)
-        if obj is not None:
-            log["objects_created"].append({
-                "row": row["row"], "element_id": eid, "kind": "translucent_volume",
-            })
-        else:
-            _build_label(row, log, reason="volume dims unsafe")
-        return
-
-    # --- Room bbox / generic bbox --------------------------------------------
-    if gtype in {"room bbox", "bbox", "bounding box"} \
-            or ptype in {"broad context bbox", "room bbox", "bounds", "bbox"}:
-        obj = _build_box_or_marker(row, log)
-        if obj is not None:
-            log["objects_created"].append({
-                "row": row["row"], "element_id": eid, "kind": "bbox",
-            })
-        return
-
-    # --- Debug lines (RULE_OUTER, RULE_INNER) --------------------------------
-    if gtype == "debug lines" or gtype == "rotation overlay":
-        if not DEBUG_MODE:
-            return
-        obj = _build_box_or_marker(row, log)
-        if obj is not None:
-            log["objects_created"].append({
-                "row": row["row"], "element_id": eid, "kind": "debug_lines",
-            })
-        else:
-            _build_label(row, log, reason="debug-lines dims unsafe")
-        return
-
-    # --- Marker + arrow (handled by spawn for ZONE_SPAWN, otherwise label) ---
-    if gtype in {"marker + arrow", "floor decal/arrow"}:
-        _build_label(row, log, reason="arrow/decal as label-only marker")
-        return
-
-    # --- Path / overlay / opening / gate / cage / plate / rail / edge --------
-    # All driven by Min/Max bbox + Base/Top Z; thin solids when appropriate.
-    polygon_preferred_types = {
-        "wire cage enclosure", "solid plate",
+    log["derived_f2_slab"] = {
+        "built": obj is not None,
+        "name": obj.name if obj is not None else None,
+        "used_fallback": used_fallback,
+        "n_extents_used": len(extents),
+        "bbox_m": (x0, y0, x1, y1),
+        "base_z": F2_SLAB_BASE_Z,
+        "top_z": F2_SLAB_TOP_Z,
     }
-    if gtype in {
-        "transparent bbox / later floor plate",
-        "path marker / floor overlay",
-        "opening/import zone",
-        "path/zone marker",
-        "transparent bbox + rotation overlays",
-        "overlook bbox / edge marker",
-        "l-shaped railing",
-        "guardrail",
-        "gate / barrier",
-        "wire cage enclosure",
-        "solid plate",
-        "edge strip",
-        "perimeter element",
-        "edge comparison",
-        "floor proxy / transparent boxes",
-        "door marker / opening",
-    }:
-        # If this row has a stacked-footprint polygon parsed from Notes
-        # (e.g. ELEM_GRND_RECYC_CAGE, ELEM_PALLET_FLOOR_PLATE), prefer the
-        # rotated polygon over the axis-aligned debug bbox.
-        if gtype in polygon_preferred_types and row.get("polygon_m"):
-            obj = _build_polygon_zone(row, log)
-            if obj is not None:
-                log["objects_created"].append({
-                    "row": row["row"], "element_id": eid,
-                    "kind": gtype + " (rotated footprint)",
-                })
-                return
-        obj = _build_box_or_marker(row, log)
-        if obj is not None:
-            log["objects_created"].append({
-                "row": row["row"], "element_id": eid, "kind": gtype,
+    if obj is not None:
+        ctx["f2_floor_plates"].insert(0, obj)
+    return obj
+
+
+def _apply_f2_cutouts(ctx, log):
+    if not APPLY_BOOLEAN_CUTOUTS:
+        log["boolean_skipped_reason"] = "APPLY_BOOLEAN_CUTOUTS=False"
+        return
+    targets = list(ctx["f2_floor_plates"])
+    for tgt in targets:
+        if tgt is None:
+            continue
+        # Compute target bbox (after potential earlier cuts use bound_box).
+        try:
+            corners = [tgt.matrix_world @ Vector(c) for c in tgt.bound_box]
+            xs = [c.x for c in corners]
+            ys = [c.y for c in corners]
+            tgt_bbox = (min(xs), min(ys), max(xs), max(ys))
+        except Exception:
+            tgt_bbox = None
+        for c in ctx["cutters"]:
+            if tgt_bbox is not None and not _bbox_overlap(tgt_bbox, c["bbox_m"]):
+                continue
+            log["boolean_attempted"].append({
+                "target": tgt.name, "cutter": c["element_id"],
             })
-        else:
-            _build_label(row, log, reason=f"{gtype}: dims unsafe → label only")
-        return
+            apply_boolean_difference(tgt, c["obj"], log)
 
-    # --- Text plane / sign ---------------------------------------------------
-    if gtype in {"text plane/sign"}:
-        _build_label(row, log, reason="text plane/sign as label only")
-        return
-
-    # --- Fallback: label / empty ---------------------------------------------
-    _build_label(row, log, reason=f"unmapped Geometry Type: {gtype!r}")
+    if DELETE_BOOLEAN_CUTTERS_AFTER_APPLY:
+        for c in ctx["cutters"]:
+            try:
+                bpy.data.objects.remove(c["obj"], do_unlink=True)
+                log["boolean_cutters_deleted"].append(c["element_id"])
+            except Exception:
+                pass
+        ctx["cutters"] = []
 
 
 # ---------------------------------------------------------------------------
@@ -1057,94 +1763,186 @@ def _build_one(row, all_rows, log):
 def write_validation_report(log, json_path):
     out_dir = os.path.dirname(os.path.abspath(json_path))
     report_path = os.path.join(out_dir, "nima_blender_build_report.txt")
-    lines = []
-    lines.append("NIMA Phase II — Blender Build Validation Report")
-    lines.append("=" * 60)
-    lines.append(f"DEBUG_MODE: {DEBUG_MODE}")
-    lines.append(f"Source JSON: {json_path}")
-    lines.append("")
-    lines.append("Collections:")
+    L = []
+
+    def add(s=""):
+        L.append(s)
+
+    add("NIMA Phase II — Blender Build Validation Report")
+    add("=" * 60)
+    add(f"DEBUG_MODE: {DEBUG_MODE}")
+    add(f"SHOW_REFERENCE_VOLUMES: {SHOW_REFERENCE_VOLUMES}")
+    add(f"SHOW_CUTOUT_VOLUMES:    {SHOW_CUTOUT_VOLUMES}")
+    add(f"BUILD_FLOOR_PLATES:     {BUILD_FLOOR_PLATES}")
+    add(f"BUILD_DERIVED_WALLS:    {BUILD_DERIVED_WALLS}")
+    add(f"APPLY_BOOLEAN_CUTOUTS:  {APPLY_BOOLEAN_CUTOUTS}")
+    add(f"DELETE_BOOLEAN_CUTTERS_AFTER_APPLY: {DELETE_BOOLEAN_CUTTERS_AFTER_APPLY}")
+    add(f"Source JSON: {json_path}")
+    add()
+
+    add("Collections:")
     for name in REQUIRED_COLLECTIONS:
         col = bpy.data.collections.get(name)
         n = len(col.all_objects) if col else 0
-        lines.append(f"  {name}: {n} objects")
-    lines.append("")
-    lines.append(f"Objects created: {len(log['objects_created'])}")
-    lines.append(f"Polygons built: {len(log['polygons_built'])}")
-    lines.append(f"Polygons skipped: {len(log['polygons_skipped'])}")
-    lines.append(f"Partial-geometry rows: {len(log['partial_geometry'])}")
-    lines.append(f"Segment lists built: {len(log['segments_built'])}")
-    lines.append(f"Window-marker lists built: {len(log['window_markers_built'])}")
-    lines.append(f"Labels-only rows: {len(log['labels_only'])}")
-    lines.append(f"Skipped rows: {len(log['skipped'])}")
-    lines.append(f"Unknown material placeholders: {len(log['unknown_material_placeholders'])}")
-    lines.append("")
+        add(f"  {name}: {n} objects")
+    add()
 
-    lines.append("Element IDs generated:")
-    for o in log["objects_created"]:
-        lines.append(f"  - row {o['row']:>3} {o['element_id']} [{o['kind']}]")
-    lines.append("")
+    add("Floor plates:")
+    add(f"  count: {len(log['floor_plates'])}")
+    for fp in log["floor_plates"]:
+        add(f"  - row {fp.get('row','?')} {fp.get('element_id')} "
+            f"[{fp.get('kind')}] -> {fp.get('name')}")
+    add()
 
-    lines.append("Polygons built:")
-    for p in log["polygons_built"]:
-        lines.append(f"  - row {p['row']} {p['element_id']}: {p['n_vertices']} vertices")
-    lines.append("")
+    ds = log.get("derived_f2_slab")
+    if ds:
+        add("Derived F2 slab envelope:")
+        if ds.get("built"):
+            add(f"  built: yes -> {ds.get('name')}")
+            add(f"  bbox m: {ds.get('bbox_m')}")
+            add(f"  base/top z: {ds.get('base_z')} / {ds.get('top_z')}")
+            add(f"  used union of {ds.get('n_extents_used')} F2 extents "
+                f"+ margin (used_fallback={ds.get('used_fallback')})")
+        else:
+            add(f"  built: NO ({ds.get('reason')})")
+    add()
 
-    if log["polygons_skipped"]:
-        lines.append("Polygons skipped:")
-        for p in log["polygons_skipped"]:
-            lines.append(f"  - row {p['row']} {p['element_id']}: {p['reason']}")
-        lines.append("")
+    add("Perimeter wall groups:")
+    add(f"  count: {len(log['perimeter_walls'])}")
+    for w in log["perimeter_walls"]:
+        skip = w.get("skipped_edges") or []
+        add(f"  - row {w.get('row','?')} {w.get('element_id')} "
+            f"[{w.get('kind')}] segments={w.get('n_segments_built')} "
+            f"skipped={skip}")
+    if log.get("mezz_open_side_skipped"):
+        add(f"  Mezz open loading side skipped: "
+            f"{log['mezz_open_side_skipped']}")
+    add()
 
-    if log["partial_geometry"]:
-        lines.append("Partial-geometry rows (outline/reference only):")
-        for p in log["partial_geometry"]:
-            lines.append(f"  - row {p['row']} {p['element_id']}: {p['reason']}")
-        lines.append("")
+    add("Doors / panels (3D solid markers):")
+    add(f"  count: {len(log['doors'])}")
+    for dr in log["doors"]:
+        add(f"  - row {dr.get('row','?')} {dr.get('element_id')} -> {dr.get('name')}")
+    add()
 
-    lines.append("F2 overlook open edges honored (no glass/wall built):")
+    add("Edge / rail elements:")
+    add(f"  rails:    {len(log['edge_rails'])}")
+    for er in log["edge_rails"]:
+        add(f"    - row {er.get('row','?')} {er.get('element_id')} "
+            f"segs={er.get('n_segments')}")
+    add(f"  outlines: {len(log['edge_outlines'])}")
+    for eo in log["edge_outlines"]:
+        add(f"    - row {eo.get('row','?')} {eo.get('element_id')} "
+            f"edges={eo.get('n_edges')}")
+    add()
+
+    add("Glass curtain wall + window segments:")
+    add(f"  segment lists built: {len(log['segments_built'])}")
+    for s in log["segments_built"]:
+        add(f"  - row {s.get('row')} {s.get('element_id')}: "
+            f"{s.get('n_segments_built')} segments")
+    add(f"  window-marker lists built: {len(log['window_markers_built'])}")
+    for s in log["window_markers_built"]:
+        add(f"  - row {s.get('row')} {s.get('element_id')}: "
+            f"{s.get('n_markers_built')} markers")
+    add()
+
+    add("F2 overlook glass perimeter:")
     if log["f2_overlook_open_edges_skipped"]:
-        for e in log["f2_overlook_open_edges_skipped"]:
-            lines.append(f"  - {e}")
+        add(f"  built per-edge against verified polygon")
+        add(f"  open edge(s) skipped: {log['f2_overlook_open_edges_skipped']}")
     else:
-        lines.append("  (none recorded — verify F2 overlook glass row was processed)")
-    lines.append("")
+        add("  (no record — F2 overlook glass row may not have processed)")
+    add()
 
-    lines.append("Skipped rows:")
+    add("F2 cutouts (stair / high-bay void):")
+    add(f"  recorded: {len(log['cutouts_recorded'])}")
+    for c in log["cutouts_recorded"]:
+        add(f"  - row {c.get('row')} {c.get('element_id')} bbox_m={c.get('bbox_m')}")
+    if log["cutouts_skipped"]:
+        add(f"  skipped:")
+        for c in log["cutouts_skipped"]:
+            add(f"  - row {c.get('row')} {c.get('element_id')}: {c.get('reason')}")
+    add(f"  outlines drawn at slab top: {len(log['cutout_outlines'])}")
+    if SHOW_CUTOUT_VOLUMES:
+        add(f"  debug previews kept (SHOW_CUTOUT_VOLUMES=True): "
+            f"{len(log['cutout_previews'])}")
+    add(f"  Boolean attempted: {len(log['boolean_attempted'])}")
+    add(f"  Boolean applied:   {len(log['boolean_applied'])}")
+    if log["boolean_failed"]:
+        add(f"  Boolean FAILED:    {len(log['boolean_failed'])}")
+        for b in log["boolean_failed"]:
+            add(f"    - target={b.get('target')} cutter={b.get('cutter')}: "
+                f"{b.get('error')}")
+    add(f"  Boolean cutters deleted: {len(log['boolean_cutters_deleted'])}")
+    if log.get("boolean_skipped_reason"):
+        add(f"  Boolean skipped: {log['boolean_skipped_reason']}")
+    add()
+
+    add("Roof / closure references:")
+    add(f"  outlines:  {len(log['roof_outlines'])}")
+    for r in log["roof_outlines"]:
+        add(f"  - {r.get('element_id')} [{r.get('kind')}] "
+            f"segs={r.get('n_segments_built','-')}")
+    add(f"  parapet edges: {len(log['parapet_edges'])}")
+    add(f"  reference volumes built:   {len(log['reference_volumes_built'])}"
+        + (" (SHOW_REFERENCE_VOLUMES=True)" if SHOW_REFERENCE_VOLUMES else ""))
+    add(f"  reference volumes skipped: {len(log['reference_volumes_skipped'])}"
+        + ("" if SHOW_REFERENCE_VOLUMES else " (SHOW_REFERENCE_VOLUMES=False)"))
+    add()
+
+    add("F2 slab envelope seeds (rows whose own footprint is missing):")
+    for s in log["f2_slab_envelope_seeds"]:
+        add(f"  - row {s.get('row')} {s.get('element_id')}: {s.get('note')}")
+    add()
+
+    add("Skipped rows:")
     for s in log["skipped"]:
-        lines.append(f"  - row {s.get('row')} {s.get('element_id')}: {s.get('reason')}")
-    lines.append("")
+        add(f"  - row {s.get('row')} {s.get('element_id')}: {s.get('reason')}")
+    add()
 
-    lines.append("Labels-only rows:")
+    add("Labels-only rows:")
     for s in log["labels_only"]:
-        lines.append(f"  - row {s['row']} {s['element_id']}: {s['reason']}")
-    lines.append("")
+        add(f"  - row {s.get('row')} {s.get('element_id')}: {s.get('reason')}")
+    add()
 
     if log["unknown_material_placeholders"]:
-        lines.append("Unknown material placeholders (defaulted to MAT_Debug_VERIFY):")
+        add("Unknown material placeholders (defaulted to MAT_Debug_VERIFY):")
         for p in log["unknown_material_placeholders"]:
-            lines.append(f"  - {p}")
-        lines.append("")
+            add(f"  - {p}")
+        add()
 
-    lines.append("Forbidden building elements check: passed.")
-    lines.append("Generated stairs: not created (only ZONE_STAIRS opening + rail).")
-    lines.append("Generated reception/casework: not created.")
-    lines.append("Exterior / site / parking / landscaping: not created.")
-    lines.append("")
+    add("Acceptance checks:")
+    add("  Forbidden building elements check: passed.")
+    add("  No generated stair geometry: passed (treads/risers/stringers/landings not created).")
+    add("  No generated reception/casework: passed.")
+    add("  No exterior / site / parking / landscaping: passed.")
+    add("  No FBX export: passed (export must be done manually).")
+    add(f"  ZONE_STAIRS rendered as solid: NO "
+        f"(used as Boolean cutter; cutters deleted="
+        f"{DELETE_BOOLEAN_CUTTERS_AFTER_APPLY}).")
+    add(f"  ZONE_HIGHBAY_VOID rendered as solid: NO "
+        f"(used as Boolean cutter; cutters deleted="
+        f"{DELETE_BOOLEAN_CUTTERS_AFTER_APPLY}).")
+    add("  F2 overlook built as polygon slab plate (3.09–3.39 m), not full block.")
+    add("  High-bay built as concrete floor + simple industrial perimeter walls.")
+    add("  Roof built as outline only by default (filled volume only when "
+        "SHOW_REFERENCE_VOLUMES=True).")
+    add()
 
-    lines.append("Scale sanity: 1 grid = 2.4384 m (locked).")
-    lines.append("F2 slab Z reference: 3.09 m (top), ~3.39 m (slab top + thickness).")
-    lines.append("High-bay interior height target: 10.31 m.")
-    lines.append("Roof reference height target: 11.91 m.")
-    lines.append("")
+    add("Scale sanity: 1 grid = 2.4384 m (locked).")
+    add(f"F2 slab Z range: {F2_SLAB_BASE_Z} -> {F2_SLAB_TOP_Z} m.")
+    add("High-bay interior height target: 10.31 m.")
+    add("Roof reference height target: 11.91 m.")
+    add()
 
     if log["warnings"]:
-        lines.append("Warnings:")
+        add("Warnings:")
         for w in log["warnings"]:
-            lines.append(f"  - {w}")
-        lines.append("")
+            add(f"  - {w}")
+        add()
 
-    text = "\n".join(lines)
+    text = "\n".join(L)
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(text + "\n")
     print(text)
@@ -1183,18 +1981,68 @@ def main():
         "unknown_material_placeholders": [],
         "f2_overlook_open_edges_skipped": [],
         "warnings": [],
+        # New keys for the walkthrough refactor:
+        "floor_plates": [],
+        "perimeter_walls": [],
+        "edge_outlines": [],
+        "edge_rails": [],
+        "doors": [],
+        "roof_outlines": [],
+        "parapet_edges": [],
+        "reference_volumes_built": [],
+        "reference_volumes_skipped": [],
+        "cutouts_recorded": [],
+        "cutouts_skipped": [],
+        "cutout_outlines": [],
+        "cutout_previews": [],
+        "boolean_attempted": [],
+        "boolean_applied": [],
+        "boolean_failed": [],
+        "boolean_cutters_deleted": [],
+        "boolean_skipped_reason": None,
+        "f2_slab_envelope_seeds": [],
+        "derived_f2_slab": None,
+        "mezz_open_side_skipped": None,
     }
 
-    # Build spawn first (always; see _build_spawn for DEBUG arrow handling).
+    geometry_rows = data.get("geometry_rows") or []
+
+    # Build context shared across passes.
+    ctx = {
+        "rows_by_eid": {
+            r["element_id"]: r for r in geometry_rows if r.get("element_id")
+        },
+        "cutters": [],
+        "f2_floor_plates": [],
+    }
+
+    # Build spawn first (DEBUG_MODE arrow handled inside).
     _build_spawn(data.get("spawn"), log)
 
-    geometry_rows = data.get("geometry_rows") or []
+    # Pass 1: per-row dispatch.
     for row in geometry_rows:
-        _build_one(row, geometry_rows, log)
+        _build_one(row, ctx, log)
+
+    # Pass 2: derived F2 slab envelope (rectangular, fills any F2 area not
+    # already covered by per-zone slabs). Sized from the union of F2 extents
+    # plus a 0.25 m margin; falls back to the Phase 0 hard-coded envelope if
+    # no F2 extents are usable.
+    _build_derived_f2_envelope(geometry_rows, ctx, log)
+
+    # Pass 3: Boolean cutouts (stair + high-bay void). Cutters are then
+    # deleted so they cannot be exported as solids.
+    _apply_f2_cutouts(ctx, log)
 
     write_validation_report(log, json_path)
-    print(f"[NIMA] Done. Built {len(log['objects_created'])} primary objects "
-          f"across {len(REQUIRED_COLLECTIONS)} collections.")
+    n_total = (len(log["floor_plates"]) + len(log["perimeter_walls"])
+               + len(log["doors"]) + len(log["edge_rails"])
+               + len(log["edge_outlines"]) + len(log["objects_created"]))
+    print(f"[NIMA] Done. Floor plates: {len(log['floor_plates'])}, "
+          f"perimeter wall groups: {len(log['perimeter_walls'])}, "
+          f"doors: {len(log['doors'])}, "
+          f"Booleans applied: {len(log['boolean_applied'])}/"
+          f"{len(log['boolean_attempted'])}, "
+          f"cutters deleted: {len(log['boolean_cutters_deleted'])}.")
 
 
 if __name__ == "__main__":
