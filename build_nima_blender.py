@@ -45,9 +45,45 @@ DEBUG_MODE = True  # First validation build: True. Set False for clean review.
 SHOW_REFERENCE_VOLUMES = False        # Hide large reference volumes by default.
 SHOW_CUTOUT_VOLUMES = False           # Hide ZONE_STAIRS / ZONE_HIGHBAY_VOID as solids.
 BUILD_FLOOR_PLATES = True             # Floor plates instead of full extrusions.
-BUILD_DERIVED_WALLS = True            # Perimeter walls around rooms / high-bay.
+BUILD_DERIVED_WALLS = True            # Perimeter walls around accepted rooms.
 APPLY_BOOLEAN_CUTOUTS = True          # Cut stair + high-bay void out of F2 slab.
 DELETE_BOOLEAN_CUTTERS_AFTER_APPLY = True  # Remove cutter meshes after Boolean.
+
+# --- Door / window / glass / roof toggles -------------------------------
+# Doors are intentionally OFF — the user will place them manually. This
+# blocks every D_F1_*/D_F2_* door, every overhead-door marker, the short
+# door at the F2 overlook SW corner, the entry-glass door proxy, the mezz
+# loading gate, and the non-working door labels.
+BUILD_DOOR_MARKERS = False
+# Window markers are off so the model stays focused on rooms/walls.
+BUILD_WINDOW_MARKERS = False
+# Glass walls (F2 overlook glass and the F1/F2 curtain-wall segment lists)
+# are kept on — they are spatial boundaries, not doors.
+BUILD_GLASS_WALLS = True
+
+# Roof / top reference visibility: independent of SHOW_REFERENCE_VOLUMES.
+BUILD_ROOF_REFERENCE = True
+BUILD_ROOF_CAP = True
+BUILD_ROOF_PARAPET = False
+# Modes:
+#   "outline_only"                 -> just a thin polygon perimeter ring
+#   "outline_and_translucent_cap"  -> ring + a translucent flat cap
+ROOF_VISUAL_MODE = "outline_and_translucent_cap"
+ROOF_CAP_THICKNESS = 0.06             # ~ 5–10 cm
+ROOF_CAP_ALPHA = 0.18                 # 0.12–0.22 readable but see-through
+
+# --- Building-shell alignment with the angled roof ----------------------
+# When True, the high-bay and any other large axis-aligned bbox row may NOT
+# emit final exterior/perimeter walls. Floor plates and accepted polygon
+# walls are still allowed.
+ALIGN_BUILDING_TO_ROOF = True
+# Build the Phase-0 translucent envelope projected from ROOF_POLYGON_VERIFY
+# down to the ground as a visual alignment reference (not a wall).
+BUILD_OUTER_SHELL_FROM_ROOF_POLYGON = True
+OUTER_SHELL_ALPHA = 0.18              # 0.15–0.25 reference shell
+# When False, ZONE_HIGHBAY / ZONE_LOBBY_CTX / context-bbox rows do NOT
+# create exterior shell walls.
+BUILD_AXIS_ALIGNED_BBOX_SHELLS = False
 
 # Floor-plate thicknesses (m). F2 plate spans 3.09 -> 3.39 (=0.30 m thick).
 F1_FLOOR_THICKNESS = 0.08             # 0.05–0.10 m per spec.
@@ -58,6 +94,10 @@ F2_SLAB_TOP_Z = F2_SLAB_BASE_Z + F2_FLOOR_THICKNESS  # 3.39
 # Phase 0 fallback envelope used only when no F2 extents exist.
 DERIVED_F2_FALLBACK_GRID = (-15.0, -8.0, 5.0, 13.0)  # (x0, y0, x1, y1)
 DERIVED_F2_MARGIN_M = 0.25
+
+# Roof reference height target (m). Used for the cap and the outer shell
+# top when the ROOF_POLYGON_VERIFY row has 'varies' for Base Z / Height.
+ROOF_TOP_Z = 11.91
 
 GRID_TO_M = 2.4384  # 1 grid square = 8 ft = 2.4384 m
 
@@ -307,7 +347,20 @@ def _make_material(name, color_rgba, alpha=1.0, blend_method="OPAQUE"):
                 bsdf.inputs["Alpha"].default_value = alpha
             if "Roughness" in bsdf.inputs:
                 bsdf.inputs["Roughness"].default_value = 0.5
-    mat.blend_method = blend_method
+    # blend_method is required for translucent materials to actually look
+    # transparent in Eevee. Wrap in try/except for Blender versions that
+    # have renamed/relocated this property.
+    try:
+        mat.blend_method = blend_method
+    except Exception:
+        pass
+    if blend_method == "BLEND":
+        for attr, val in (("show_transparent_back", False),
+                          ("shadow_method", "HASHED")):
+            try:
+                setattr(mat, attr, val)
+            except Exception:
+                pass
     return mat
 
 
@@ -354,6 +407,9 @@ MATERIAL_PALETTE = {
     "MAT_Slab_ConcretePlaceholder": ((0.70, 0.70, 0.68), 1.0, "OPAQUE"),
     # Roof
     "MAT_Roof_StructurePlaceholder": ((0.55, 0.55, 0.55), 0.60, "BLEND"),
+    # Roof cap (translucent) + outer-shell reference envelope (translucent).
+    "MAT_Roof_Cap_Translucent":      ((0.55, 0.55, 0.55), ROOF_CAP_ALPHA, "BLEND"),
+    "MAT_OuterShell_Reference":      ((0.45, 0.55, 0.70), OUTER_SHELL_ALPHA, "BLEND"),
 }
 
 
@@ -1107,16 +1163,49 @@ ELEMENT_ROLES = {
 }
 
 
+DOOR_LIKE_ELEMENT_IDS = {
+    "ELEM_MEZZ_LOADING_GATE",
+    "ELEM_SHORT_DOOR_F2_SW",
+    "ELEM_ENTRY_GLASS_PROXY",
+    "ELEM_OVERHEAD_VERIFY",
+    "ELEM_NONWORKING_DOOR_LABELS",  # door labels — also off when doors off
+}
+
+
+def _is_door_like(row):
+    """Return True if a row should be considered a door / panel / gate /
+    door-label so it can be uniformly suppressed when BUILD_DOOR_MARKERS=False."""
+    eid = (row.get("element_id") or "")
+    if eid.startswith("D_F1_") or eid.startswith("D_F2_"):
+        return True
+    if eid in DOOR_LIKE_ELEMENT_IDS:
+        return True
+    cat = (row.get("category") or "").lower()
+    if "door marker" in cat:
+        return True
+    gtype = (row.get("geometry_type") or "").lower()
+    if "door/panel" in gtype or "door marker" in gtype \
+            or gtype.startswith("glass door") or gtype.startswith("wide panel"):
+        return True
+    door_func = row.get("door_function")
+    if door_func not in (None, "", "N/A"):
+        return True
+    return False
+
+
 def _classify_role(row):
     eid = row.get("element_id") or ""
+
+    # Door suppression takes precedence over any explicit role mapping so
+    # the user can flip BUILD_DOOR_MARKERS without re-editing the table.
+    if _is_door_like(row):
+        return "door_panel" if BUILD_DOOR_MARKERS else "skip_door"
+
     role = ELEMENT_ROLES.get(eid)
     if role is not None:
         return role
-    if eid.startswith("D_F1_") or eid.startswith("D_F2_"):
-        return "door_panel"
+
     gtype = (row.get("geometry_type") or "").lower()
-    if "door/panel" in gtype or "door marker" in gtype:
-        return "door_panel"
     if gtype.startswith("segment list"):
         return "segment_list"
     if "window marker" in gtype:
@@ -1288,18 +1377,47 @@ def _role_highbay(row, ctx, log):
             "kind": "highbay_concrete", "name": floor_obj.name,
         })
 
-    if BUILD_DERIVED_WALLS:
+    # Walls: only build when BOTH the general walls toggle AND the
+    # axis-aligned shell toggle allow it AND we are not aligning the
+    # building to the angled roof. Otherwise the high-bay rectangle below
+    # the angled roof produces the misaligned look the user flagged.
+    walls_allowed = (
+        BUILD_DERIVED_WALLS
+        and BUILD_AXIS_ALIGNED_BBOX_SHELLS
+        and not ALIGN_BUILDING_TO_ROOF
+    )
+    has_polygon = bool(row.get("polygon_m"))
+    if walls_allowed or has_polygon:
         wall_thk = 0.25  # high-bay walls are heftier
         wall_mat = _ensure("MAT_HighBay_SolidIndustrialWall")
-        walls = make_bbox_perimeter_walls(
-            safe_object_name("WALL", eid), x0, y0, x1, y1,
-            floor_top, top_z, wall_thk,
-            row["collection_target"], wall_mat,
-        )
-        log["perimeter_walls"].append({
+        if has_polygon:
+            walls = make_polygon_perimeter_walls(
+                safe_object_name("WALL", eid), row["polygon_m"],
+                floor_top, top_z, wall_thk,
+                row["collection_target"], wall_mat,
+            )
+            log["perimeter_walls"].append({
+                "row": row["row"], "element_id": eid,
+                "kind": "highbay_polygon",
+                "n_segments_built": len(walls),
+            })
+        else:
+            walls = make_bbox_perimeter_walls(
+                safe_object_name("WALL", eid), x0, y0, x1, y1,
+                floor_top, top_z, wall_thk,
+                row["collection_target"], wall_mat,
+            )
+            log["perimeter_walls"].append({
+                "row": row["row"], "element_id": eid,
+                "kind": "highbay_axis_aligned_bbox",
+                "n_segments_built": len(walls),
+            })
+    else:
+        log["axis_aligned_shell_skipped"].append({
             "row": row["row"], "element_id": eid,
-            "kind": "highbay_industrial",
-            "n_segments_built": len(walls),
+            "reason": ("ALIGN_BUILDING_TO_ROOF=True / "
+                       "BUILD_AXIS_ALIGNED_BBOX_SHELLS=False; "
+                       "high-bay walls require an accepted angled polygon."),
         })
 
     if SHOW_REFERENCE_VOLUMES:
@@ -1478,11 +1596,25 @@ def _role_door_panel(row, ctx, log):
         _role_label(row, ctx, log, reason="door dims unsafe")
 
 
+def _role_skip_door(row, ctx, log):
+    """No mesh, no label, no empty — user will add doors manually."""
+    log["doors_skipped"].append({
+        "row": row["row"], "element_id": row["element_id"],
+        "reason": "BUILD_DOOR_MARKERS=False; user will add doors manually.",
+    })
+
+
 def _role_label(row, ctx, log, reason="label fallback"):
     _build_label(row, log, reason=reason)
 
 
 def _role_f2_overlook_glass_per_edge(row, ctx, log):
+    if not BUILD_GLASS_WALLS:
+        log["glass_segments_skipped"].append({
+            "row": row["row"], "element_id": row["element_id"],
+            "reason": "BUILD_GLASS_WALLS=False",
+        })
+        return
     _build_f2_overlook_glass(row, list(ctx["rows_by_eid"].values()), log)
 
 
@@ -1498,44 +1630,72 @@ def _role_roof_outline(row, ctx, log):
     poly = row.get("polygon_m")
     if not poly or len(poly) < 3:
         return _role_label(row, ctx, log, reason="roof: no polygon")
-    top_z = safe_float(row["dims"].get("top_z_m")) or 11.91
-    mat = _ensure("MAT_Roof_StructurePlaceholder")
-    if SHOW_REFERENCE_VOLUMES:
-        obj = make_polygon_floor_plate(
-            safe_object_name("ROOF", eid), poly, top_z - 0.10, top_z,
-            row["collection_target"], mat,
-        )
-        log["roof_outlines"].append({
-            "element_id": eid, "kind": "filled",
-            "name": obj.name if obj is not None else None,
+    if not BUILD_ROOF_REFERENCE:
+        log["roof_skipped"].append({
+            "row": row["row"], "element_id": eid,
+            "reason": "BUILD_ROOF_REFERENCE=False",
         })
+        return
+    top_z = safe_float(row["dims"].get("top_z_m")) or ROOF_TOP_Z
+    perimeter_mat = _ensure("MAT_Roof_StructurePlaceholder")
+
+    # Always emit the perimeter ring (visible by default).
+    edge_h = 0.05
+    ring_name = f"ROOF_OUTLINE_{eid}"
+    walls = make_polygon_perimeter_walls(
+        ring_name, poly,
+        top_z - edge_h * 0.5, top_z + edge_h * 0.5,
+        0.10, "NIMA_Roof", perimeter_mat,
+    )
+    log["roof_outlines"].append({
+        "row": row["row"], "element_id": eid,
+        "kind": "perimeter_ring", "n_segments_built": len(walls),
+    })
+
+    if BUILD_ROOF_CAP and ROOF_VISUAL_MODE == "outline_and_translucent_cap":
+        cap_mat = _ensure("MAT_Roof_Cap_Translucent")
+        cap_name = f"ROOF_CAP_{eid}"
+        cap = make_polygon_floor_plate(
+            cap_name, poly,
+            top_z - ROOF_CAP_THICKNESS, top_z,
+            "NIMA_Roof", cap_mat,
+        )
+        log["roof_cap"] = {
+            "built": cap is not None,
+            "name": cap.name if cap is not None else None,
+            "alpha": ROOF_CAP_ALPHA,
+            "blend_method": "BLEND",
+            "thickness_m": ROOF_CAP_THICKNESS,
+            "z_top": top_z,
+        }
     else:
-        edge_h = 0.05
-        walls = make_polygon_perimeter_walls(
-            safe_object_name("ROOF_EDGE", eid), poly,
-            top_z - edge_h * 0.5, top_z + edge_h * 0.5,
-            0.06, row["collection_target"], mat,
-        )
-        log["roof_outlines"].append({
-            "element_id": eid, "kind": "perimeter",
-            "n_segments_built": len(walls),
-        })
+        log["roof_cap"] = {
+            "built": False,
+            "reason": ("BUILD_ROOF_CAP=False" if not BUILD_ROOF_CAP
+                       else f"ROOF_VISUAL_MODE={ROOF_VISUAL_MODE!r}"),
+        }
 
 
 def _role_roof_parapet_edge(row, ctx, log):
     eid = row["element_id"]
+    if not BUILD_ROOF_PARAPET:
+        log["parapet_edges_skipped"].append({
+            "row": row["row"], "element_id": eid,
+            "reason": "BUILD_ROOF_PARAPET=False",
+        })
+        return
     roof_row = ctx["rows_by_eid"].get("ROOF_POLYGON_VERIFY")
     poly = roof_row.get("polygon_m") if roof_row else None
     if not poly or len(poly) < 3:
         return _role_label(row, ctx, log,
                            reason="parapet: ROOF_POLYGON_VERIFY polygon missing")
-    base_z = safe_float(row["dims"].get("base_z_m")) or 11.91
+    base_z = safe_float(row["dims"].get("base_z_m")) or ROOF_TOP_Z
     top_z = safe_float(row["dims"].get("top_z_m")) or 12.37
     thk = safe_float(row["dims"].get("thickness_m")) or 0.254
     mat = _ensure("MAT_Roof_StructurePlaceholder")
     walls = make_polygon_perimeter_walls(
         safe_object_name("PARAPET", eid), poly, base_z, top_z, thk,
-        row["collection_target"], mat,
+        "NIMA_Roof", mat,
     )
     log["parapet_edges"].append({
         "row": row["row"], "element_id": eid, "n_segments_built": len(walls),
@@ -1597,10 +1757,22 @@ def _role_debug_overlay(row, ctx, log):
 
 
 def _role_segment_list(row, ctx, log):
+    if not BUILD_GLASS_WALLS:
+        log["glass_segments_skipped"].append({
+            "row": row["row"], "element_id": row["element_id"],
+            "reason": "BUILD_GLASS_WALLS=False",
+        })
+        return
     _build_segment_list(row, log)
 
 
 def _role_window_markers(row, ctx, log):
+    if not BUILD_WINDOW_MARKERS:
+        log["windows_skipped"].append({
+            "row": row["row"], "element_id": row["element_id"],
+            "reason": "BUILD_WINDOW_MARKERS=False",
+        })
+        return
     _build_window_markers(row, log)
 
 
@@ -1620,6 +1792,7 @@ ROLE_HANDLERS = {
     "edge_rail_bbox":            _role_edge_rail_bbox,
     "polygon_perimeter_walls":   _role_polygon_perimeter_walls,
     "polygon_floor_plate_explicit": _role_polygon_floor_plate_explicit,
+    "skip_door":                 _role_skip_door,
     "door_panel":                _role_door_panel,
     "label":                     _role_label,
     "f2_overlook_glass_per_edge": _role_f2_overlook_glass_per_edge,
@@ -1756,6 +1929,52 @@ def _apply_f2_cutouts(ctx, log):
         ctx["cutters"] = []
 
 
+def _build_outer_shell_reference_envelope(ctx, log):
+    """Phase 0/1 translucent envelope projected from ROOF_POLYGON_VERIFY
+    down to the ground. This is an alignment reference so the building
+    below can be visually checked against the angled roof footprint. It
+    is NOT wall geometry — no collision, no nav role, no export intent.
+
+    The roof polygon includes overhangs; do NOT shrink/crop it.
+    """
+    if not BUILD_OUTER_SHELL_FROM_ROOF_POLYGON:
+        log["outer_shell_reference"] = {
+            "built": False,
+            "reason": "BUILD_OUTER_SHELL_FROM_ROOF_POLYGON=False",
+        }
+        return None
+    roof_row = ctx["rows_by_eid"].get("ROOF_POLYGON_VERIFY")
+    poly = roof_row.get("polygon_m") if roof_row else None
+    if not poly or len(poly) < 3:
+        log["outer_shell_reference"] = {
+            "built": False,
+            "reason": "ROOF_POLYGON_VERIFY polygon not available",
+        }
+        return None
+
+    top_z = safe_float(roof_row["dims"].get("top_z_m")) or ROOF_TOP_Z
+    base_z = 0.0
+    mat = _ensure("MAT_OuterShell_Reference")
+    obj = make_polygon_extrusion(
+        "OUTER_SHELL_REFERENCE_ENVELOPE",
+        poly, base_z, top_z,
+        "NIMA_Debug_Reference", mat,
+    )
+    log["outer_shell_reference"] = {
+        "built": obj is not None,
+        "name": obj.name if obj is not None else None,
+        "alpha": OUTER_SHELL_ALPHA,
+        "blend_method": "BLEND",
+        "base_z": base_z,
+        "top_z": top_z,
+        "n_vertices": len(poly),
+        "note": ("Roof-projected shell is reference only; "
+                 "true final wall polygon required in future phase. "
+                 "Roof overhang must NOT be used as literal wall boundary."),
+    }
+    return obj
+
+
 # ---------------------------------------------------------------------------
 # Validation report
 # ---------------------------------------------------------------------------
@@ -1770,13 +1989,23 @@ def write_validation_report(log, json_path):
 
     add("NIMA Phase II — Blender Build Validation Report")
     add("=" * 60)
-    add(f"DEBUG_MODE: {DEBUG_MODE}")
-    add(f"SHOW_REFERENCE_VOLUMES: {SHOW_REFERENCE_VOLUMES}")
-    add(f"SHOW_CUTOUT_VOLUMES:    {SHOW_CUTOUT_VOLUMES}")
-    add(f"BUILD_FLOOR_PLATES:     {BUILD_FLOOR_PLATES}")
-    add(f"BUILD_DERIVED_WALLS:    {BUILD_DERIVED_WALLS}")
-    add(f"APPLY_BOOLEAN_CUTOUTS:  {APPLY_BOOLEAN_CUTOUTS}")
-    add(f"DELETE_BOOLEAN_CUTTERS_AFTER_APPLY: {DELETE_BOOLEAN_CUTTERS_AFTER_APPLY}")
+    add(f"DEBUG_MODE:                          {DEBUG_MODE}")
+    add(f"SHOW_REFERENCE_VOLUMES:              {SHOW_REFERENCE_VOLUMES}")
+    add(f"SHOW_CUTOUT_VOLUMES:                 {SHOW_CUTOUT_VOLUMES}")
+    add(f"BUILD_FLOOR_PLATES:                  {BUILD_FLOOR_PLATES}")
+    add(f"BUILD_DERIVED_WALLS:                 {BUILD_DERIVED_WALLS}")
+    add(f"APPLY_BOOLEAN_CUTOUTS:               {APPLY_BOOLEAN_CUTOUTS}")
+    add(f"DELETE_BOOLEAN_CUTTERS_AFTER_APPLY:  {DELETE_BOOLEAN_CUTTERS_AFTER_APPLY}")
+    add(f"BUILD_DOOR_MARKERS:                  {BUILD_DOOR_MARKERS}")
+    add(f"BUILD_WINDOW_MARKERS:                {BUILD_WINDOW_MARKERS}")
+    add(f"BUILD_GLASS_WALLS:                   {BUILD_GLASS_WALLS}")
+    add(f"BUILD_ROOF_REFERENCE:                {BUILD_ROOF_REFERENCE}")
+    add(f"BUILD_ROOF_CAP:                      {BUILD_ROOF_CAP}")
+    add(f"BUILD_ROOF_PARAPET:                  {BUILD_ROOF_PARAPET}")
+    add(f"ROOF_VISUAL_MODE:                    {ROOF_VISUAL_MODE!r}")
+    add(f"ALIGN_BUILDING_TO_ROOF:              {ALIGN_BUILDING_TO_ROOF}")
+    add(f"BUILD_OUTER_SHELL_FROM_ROOF_POLYGON: {BUILD_OUTER_SHELL_FROM_ROOF_POLYGON}")
+    add(f"BUILD_AXIS_ALIGNED_BBOX_SHELLS:      {BUILD_AXIS_ALIGNED_BBOX_SHELLS}")
     add(f"Source JSON: {json_path}")
     add()
 
@@ -1836,15 +2065,33 @@ def write_validation_report(log, json_path):
             f"edges={eo.get('n_edges')}")
     add()
 
-    add("Glass curtain wall + window segments:")
-    add(f"  segment lists built: {len(log['segments_built'])}")
-    for s in log["segments_built"]:
-        add(f"  - row {s.get('row')} {s.get('element_id')}: "
-            f"{s.get('n_segments_built')} segments")
+    add("Doors (BUILD_DOOR_MARKERS):")
+    add(f"  doors built:   {len(log['doors'])}")
+    add(f"  doors skipped: {len(log['doors_skipped'])}")
+    for d in log["doors_skipped"]:
+        add(f"  - row {d.get('row')} {d.get('element_id')}: {d.get('reason')}")
+    if not BUILD_DOOR_MARKERS:
+        add("  Confirmation: no door marker objects, no door labels, no door empties.")
+    add()
+
+    add("Windows (BUILD_WINDOW_MARKERS):")
     add(f"  window-marker lists built: {len(log['window_markers_built'])}")
     for s in log["window_markers_built"]:
         add(f"  - row {s.get('row')} {s.get('element_id')}: "
             f"{s.get('n_markers_built')} markers")
+    add(f"  window-marker rows skipped: {len(log['windows_skipped'])}")
+    for s in log["windows_skipped"]:
+        add(f"  - row {s.get('row')} {s.get('element_id')}: {s.get('reason')}")
+    add()
+
+    add("Glass walls / curtain wall segments (BUILD_GLASS_WALLS):")
+    add(f"  segment lists built: {len(log['segments_built'])}")
+    for s in log["segments_built"]:
+        add(f"  - row {s.get('row')} {s.get('element_id')}: "
+            f"{s.get('n_segments_built')} segments")
+    add(f"  glass rows skipped:  {len(log['glass_segments_skipped'])}")
+    for s in log["glass_segments_skipped"]:
+        add(f"  - row {s.get('row')} {s.get('element_id')}: {s.get('reason')}")
     add()
 
     add("F2 overlook glass perimeter:")
@@ -1879,16 +2126,53 @@ def write_validation_report(log, json_path):
         add(f"  Boolean skipped: {log['boolean_skipped_reason']}")
     add()
 
-    add("Roof / closure references:")
-    add(f"  outlines:  {len(log['roof_outlines'])}")
+    add("Roof / top reference:")
+    add(f"  outlines (perimeter rings): {len(log['roof_outlines'])}")
     for r in log["roof_outlines"]:
         add(f"  - {r.get('element_id')} [{r.get('kind')}] "
             f"segs={r.get('n_segments_built','-')}")
-    add(f"  parapet edges: {len(log['parapet_edges'])}")
-    add(f"  reference volumes built:   {len(log['reference_volumes_built'])}"
+    cap = log.get("roof_cap")
+    if cap is None:
+        add("  Roof cap: (not processed — ROOF_POLYGON_VERIFY did not run)")
+    elif cap.get("built"):
+        add(f"  Roof cap built: yes -> {cap.get('name')}")
+        add(f"    blend_method=BLEND alpha={cap.get('alpha')} "
+            f"thk={cap.get('thickness_m')} z_top={cap.get('z_top')}")
+    else:
+        add(f"  Roof cap built: no ({cap.get('reason')})")
+    if log["roof_skipped"]:
+        add(f"  Roof rows skipped: {len(log['roof_skipped'])}")
+        for s in log["roof_skipped"]:
+            add(f"  - row {s.get('row')} {s.get('element_id')}: {s.get('reason')}")
+    add(f"  Parapet edges built: {len(log['parapet_edges'])}")
+    if log["parapet_edges_skipped"]:
+        add(f"  Parapet edges skipped: {len(log['parapet_edges_skipped'])}")
+        for s in log["parapet_edges_skipped"]:
+            add(f"  - row {s.get('row')} {s.get('element_id')}: {s.get('reason')}")
+    add(f"  Reference volumes built:   {len(log['reference_volumes_built'])}"
         + (" (SHOW_REFERENCE_VOLUMES=True)" if SHOW_REFERENCE_VOLUMES else ""))
-    add(f"  reference volumes skipped: {len(log['reference_volumes_skipped'])}"
+    add(f"  Reference volumes skipped: {len(log['reference_volumes_skipped'])}"
         + ("" if SHOW_REFERENCE_VOLUMES else " (SHOW_REFERENCE_VOLUMES=False)"))
+    add()
+
+    add("Building-shell alignment with angled roof:")
+    sh = log.get("outer_shell_reference")
+    if sh and sh.get("built"):
+        add(f"  OUTER_SHELL_REFERENCE_ENVELOPE built: yes "
+            f"-> {sh.get('name')}")
+        add(f"    blend_method=BLEND alpha={sh.get('alpha')} "
+            f"base_z={sh.get('base_z')} top_z={sh.get('top_z')} "
+            f"verts={sh.get('n_vertices')}")
+        add(f"    {sh.get('note')}")
+    elif sh:
+        add(f"  OUTER_SHELL_REFERENCE_ENVELOPE built: no "
+            f"({sh.get('reason')})")
+    else:
+        add("  OUTER_SHELL_REFERENCE_ENVELOPE: (not processed)")
+    add(f"  Axis-aligned shell rows skipped: "
+        f"{len(log['axis_aligned_shell_skipped'])}")
+    for s in log["axis_aligned_shell_skipped"]:
+        add(f"  - row {s.get('row')} {s.get('element_id')}: {s.get('reason')}")
     add()
 
     add("F2 slab envelope seeds (rows whose own footprint is missing):")
@@ -1918,6 +2202,20 @@ def write_validation_report(log, json_path):
     add("  No generated reception/casework: passed.")
     add("  No exterior / site / parking / landscaping: passed.")
     add("  No FBX export: passed (export must be done manually).")
+    add(f"  No door markers generated: "
+        f"{'YES' if not BUILD_DOOR_MARKERS else 'NO (BUILD_DOOR_MARKERS=True)'}")
+    add(f"  No window markers generated: "
+        f"{'YES' if not BUILD_WINDOW_MARKERS else 'NO (BUILD_WINDOW_MARKERS=True)'}")
+    add(f"  Roof cap material blend_method = BLEND: "
+        f"{'YES' if (log.get('roof_cap') or {}).get('blend_method') == 'BLEND' else 'n/a'}")
+    add("  Roof-projected outer shell is reference only "
+        "(no collision, no walls, not a nav boundary).")
+    add("  Roof overhang NOT used as literal wall boundary.")
+    if ALIGN_BUILDING_TO_ROOF and not BUILD_AXIS_ALIGNED_BBOX_SHELLS:
+        add("  Axis-aligned bbox shells suppressed "
+            "(ALIGN_BUILDING_TO_ROOF=True, BUILD_AXIS_ALIGNED_BBOX_SHELLS=False).")
+        add("  Building below roof: floors + accepted polygon walls + glass; "
+            "exterior shell shown only as the translucent roof-projected envelope.")
     add(f"  ZONE_STAIRS rendered as solid: NO "
         f"(used as Boolean cutter; cutters deleted="
         f"{DELETE_BOOLEAN_CUTTERS_AFTER_APPLY}).")
@@ -1981,7 +2279,7 @@ def main():
         "unknown_material_placeholders": [],
         "f2_overlook_open_edges_skipped": [],
         "warnings": [],
-        # New keys for the walkthrough refactor:
+        # Walkthrough refactor keys:
         "floor_plates": [],
         "perimeter_walls": [],
         "edge_outlines": [],
@@ -2003,6 +2301,15 @@ def main():
         "f2_slab_envelope_seeds": [],
         "derived_f2_slab": None,
         "mezz_open_side_skipped": None,
+        # Door / window / roof / shell-alignment patch keys:
+        "doors_skipped": [],
+        "windows_skipped": [],
+        "glass_segments_skipped": [],
+        "axis_aligned_shell_skipped": [],
+        "parapet_edges_skipped": [],
+        "roof_skipped": [],
+        "roof_cap": None,
+        "outer_shell_reference": None,
     }
 
     geometry_rows = data.get("geometry_rows") or []
@@ -2032,6 +2339,10 @@ def main():
     # Pass 3: Boolean cutouts (stair + high-bay void). Cutters are then
     # deleted so they cannot be exported as solids.
     _apply_f2_cutouts(ctx, log)
+
+    # Pass 4: outer-shell reference envelope projected from the roof
+    # polygon. Translucent alignment reference only — never wall geometry.
+    _build_outer_shell_reference_envelope(ctx, log)
 
     write_validation_report(log, json_path)
     n_total = (len(log["floor_plates"]) + len(log["perimeter_walls"])
