@@ -112,10 +112,41 @@ default — open Blender interactively after review to save / export.
 
 In order:
 
-1. `$NIMA_SCHEDULE_JSON` environment variable
-2. The directory of `build_nima_blender.py`
-3. The directory of the currently open `.blend`
-4. The current working directory
+1. The `SCHEDULE_JSON_PATH` constant at the top of `build_nima_blender.py`
+   (empty by default — set this to a full absolute path if auto-discovery fails).
+2. `$NIMA_SCHEDULE_JSON` environment variable.
+3. Directory of `build_nima_blender.py` (when launched as `blender --python`).
+4. Directory of the script's open Text Editor block (when run from inside Blender).
+5. Directory of the currently open `.blend`.
+6. Common locations: `~/Desktop/Blender Files/`, `~/Desktop/`,
+   `~/Documents/Blender Files/`, `~/Documents/`.
+7. The current working directory.
+
+### macOS quick start (folder = `~/Desktop/Blender Files/`)
+
+1. Copy `extract_schedule_to_json.py`, `build_nima_blender.py`, and the
+   locked workbook (`NIMA_Phase2_Master_Schedule_LOCKED-3.xlsx`) into
+   `~/Desktop/Blender Files/`.
+2. Open Terminal and run the extractor first — the Blender script does not
+   read the `.xlsx` directly:
+   ```bash
+   cd "$HOME/Desktop/Blender Files"
+   python3 -m pip install --user openpyxl    # one-time
+   python3 extract_schedule_to_json.py
+   ```
+   Confirm `nima_schedule.json` and `nima_schedule_extractor_report.txt`
+   now exist next to the `.py` files.
+3. Open Blender 4.x → Text Editor → **Open** → choose
+   `~/Desktop/Blender Files/build_nima_blender.py` → click **Run Script**
+   (or press `Alt+P`). The auto-discovery will find the JSON in the same
+   folder.
+4. If you still see "nima_schedule.json not found", edit the constant near
+   the top of `build_nima_blender.py`:
+   ```python
+   SCHEDULE_JSON_PATH = "/Users/yourname/Desktop/Blender Files/nima_schedule.json"
+   ```
+   Replace `yourname` with your macOS username (`echo $HOME` in Terminal
+   prints it). Save the script and run again.
 
 ## 5. What the Blender build produces
 

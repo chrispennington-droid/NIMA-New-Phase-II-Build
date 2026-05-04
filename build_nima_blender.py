@@ -41,6 +41,15 @@ from mathutils import Vector
 
 DEBUG_MODE = True  # First validation build: True. Set False for clean review.
 
+# If `nima_schedule.json` cannot be auto-discovered (common when running from
+# Blender's Text Editor), put the FULL absolute path to the JSON file here.
+# macOS example:
+#   SCHEDULE_JSON_PATH = "/Users/yourname/Desktop/Blender Files/nima_schedule.json"
+# Windows example:
+#   SCHEDULE_JSON_PATH = r"C:\Users\yourname\Desktop\Blender Files\nima_schedule.json"
+# Leave empty to rely on auto-discovery + the env var $NIMA_SCHEDULE_JSON.
+SCHEDULE_JSON_PATH = ""
+
 # RULE_F2_STAIR_TO_OVERLOOK_OPEN (workbook row 99): no wall, glass, guard,
 # or barrier geometry between the stair cutout and the SW corner of the F2
 # overlook. The polygon vertex order is NW -> NE -> SE -> SW (closed). The
@@ -113,27 +122,103 @@ def safe_object_name(prefix, eid):
     return base[:60]
 
 
+def _script_text_dir():
+    """If this script is loaded as a Blender Text Editor block with a
+    filepath, return the directory of that file. Returns None otherwise."""
+    try:
+        for text in bpy.data.texts:
+            fp = getattr(text, "filepath", "") or ""
+            if fp:
+                # Resolve any '//' Blender-relative prefix.
+                resolved = bpy.path.abspath(fp)
+                if resolved and os.path.isfile(resolved):
+                    base = os.path.basename(resolved).lower()
+                    if base in ("build_nima_blender.py", "nima_blender.py"):
+                        return os.path.dirname(resolved)
+    except Exception:
+        pass
+    return None
+
+
 def find_schedule_json():
     candidates = []
+
+    # 1. User-set hardcoded path at the top of this file.
+    if SCHEDULE_JSON_PATH:
+        candidates.append(os.path.expanduser(SCHEDULE_JSON_PATH))
+
+    # 2. Environment variable.
     env = os.environ.get("NIMA_SCHEDULE_JSON")
     if env:
-        candidates.append(env)
+        candidates.append(os.path.expanduser(env))
+
+    # 3. Directory of __file__ (works when launched via `blender --python`).
     if "__file__" in globals():
-        candidates.append(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "nima_schedule.json")
-        )
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            if here and here != "/":
+                candidates.append(os.path.join(here, "nima_schedule.json"))
+        except Exception:
+            pass
+
+    # 4. Directory of the currently open Text Editor block (Run Script flow).
+    text_dir = _script_text_dir()
+    if text_dir:
+        candidates.append(os.path.join(text_dir, "nima_schedule.json"))
+
+    # 5. Directory of the currently open .blend, if any.
     if bpy.data.filepath:
         candidates.append(
             os.path.join(os.path.dirname(bpy.data.filepath), "nima_schedule.json")
         )
+
+    # 6. Common macOS / Windows / Linux folders the user may have created.
+    home = os.path.expanduser("~")
+    common_dirs = [
+        os.path.join(home, "Desktop", "Blender Files"),
+        os.path.join(home, "Desktop", "blender files"),
+        os.path.join(home, "Desktop"),
+        os.path.join(home, "Documents", "Blender Files"),
+        os.path.join(home, "Documents"),
+    ]
+    for d in common_dirs:
+        candidates.append(os.path.join(d, "nima_schedule.json"))
+
+    # 7. Current working directory.
     candidates.append(os.path.join(os.getcwd(), "nima_schedule.json"))
+
+    # Deduplicate while preserving order.
+    seen = set()
+    deduped = []
     for c in candidates:
-        if c and os.path.isfile(c):
+        if c and c not in seen:
+            seen.add(c)
+            deduped.append(c)
+
+    for c in deduped:
+        if os.path.isfile(c):
             return c
-    raise FileNotFoundError(
-        f"nima_schedule.json not found. Searched: {candidates}"
-    )
+
+    msg_lines = [
+        "nima_schedule.json not found.",
+        "",
+        "FIX (pick one):",
+        "  1. Run extract_schedule_to_json.py (outside Blender) FIRST so the",
+        "     JSON file is created. The Blender script consumes that JSON;",
+        "     it does not read the .xlsx directly.",
+        "  2. Place nima_schedule.json in the same folder as",
+        "     build_nima_blender.py.",
+        "  3. Or set SCHEDULE_JSON_PATH at the top of build_nima_blender.py",
+        '     to the full absolute path, e.g.:',
+        '       SCHEDULE_JSON_PATH = "/Users/yourname/Desktop/Blender Files/nima_schedule.json"',
+        "  4. Or set the environment variable NIMA_SCHEDULE_JSON before",
+        "     launching Blender.",
+        "",
+        "Searched these locations (in order):",
+    ]
+    for c in deduped:
+        msg_lines.append(f"  - {c}")
+    raise FileNotFoundError("\n".join(msg_lines))
 
 
 # ---------------------------------------------------------------------------
