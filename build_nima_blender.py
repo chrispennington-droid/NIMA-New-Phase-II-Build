@@ -39,21 +39,21 @@ from mathutils import Vector
 # User-tunable constants
 # ---------------------------------------------------------------------------
 
-DEBUG_MODE = True  # First validation build: True. Set False for clean review.
+DEBUG_MODE = False  # Sparse, clean review build. Set True only for debug.
 
 # --- Walkthrough realism toggles ----------------------------------------
 SHOW_REFERENCE_VOLUMES = False        # Hide large reference volumes by default.
 SHOW_CUTOUT_VOLUMES = False           # Hide ZONE_STAIRS / ZONE_HIGHBAY_VOID as solids.
+SHOW_CUTOUT_OUTLINES = False          # Hide thin outlines at cutouts; default off.
 BUILD_FLOOR_PLATES = True             # Floor plates instead of full extrusions.
-BUILD_DERIVED_WALLS = True            # Perimeter walls around accepted rooms.
-APPLY_BOOLEAN_CUTOUTS = True          # Cut stair + high-bay void out of F2 slab.
-DELETE_BOOLEAN_CUTTERS_AFTER_APPLY = True  # Remove cutter meshes after Boolean.
+BUILD_DERIVED_WALLS = True            # Local accepted-room walls only.
+BUILD_DERIVED_F2_SLAB_ENVELOPE = False  # Do NOT invent a union/fallback F2 slab.
+APPLY_BOOLEAN_CUTOUTS = False         # No Boolean cutters; nothing to cut into.
+DELETE_BOOLEAN_CUTTERS_AFTER_APPLY = True  # (only matters if cutouts run.)
+BUILD_EDGE_RAILS = False              # Skip rail / guard / void-edge / overlook-edge.
 
 # --- Door / window / glass / roof toggles -------------------------------
-# Doors are intentionally OFF — the user will place them manually. This
-# blocks every D_F1_*/D_F2_* door, every overhead-door marker, the short
-# door at the F2 overlook SW corner, the entry-glass door proxy, the mezz
-# loading gate, and the non-working door labels.
+# Doors are intentionally OFF — the user will place them manually.
 BUILD_DOOR_MARKERS = False
 # Window markers are off so the model stays focused on rooms/walls.
 BUILD_WINDOW_MARKERS = False
@@ -70,19 +70,16 @@ BUILD_ROOF_PARAPET = False
 #   "outline_and_translucent_cap"  -> ring + a translucent flat cap
 ROOF_VISUAL_MODE = "outline_and_translucent_cap"
 ROOF_CAP_THICKNESS = 0.06             # ~ 5–10 cm
-ROOF_CAP_ALPHA = 0.18                 # 0.12–0.22 readable but see-through
+ROOF_CAP_ALPHA = 0.20                 # 0.12–0.22 readable but see-through
 
 # --- Building-shell alignment with the angled roof ----------------------
 # When True, the high-bay and any other large axis-aligned bbox row may NOT
 # emit final exterior/perimeter walls. Floor plates and accepted polygon
 # walls are still allowed.
 ALIGN_BUILDING_TO_ROOF = True
-# Build the Phase-0 translucent envelope projected from ROOF_POLYGON_VERIFY
-# down to the ground as a visual alignment reference (not a wall).
-BUILD_OUTER_SHELL_FROM_ROOF_POLYGON = True
-OUTER_SHELL_ALPHA = 0.18              # 0.15–0.25 reference shell
-# When False, ZONE_HIGHBAY / ZONE_LOBBY_CTX / context-bbox rows do NOT
-# create exterior shell walls.
+# Roof-projected reference shell is OFF for the sparse review pass.
+BUILD_OUTER_SHELL_FROM_ROOF_POLYGON = False
+OUTER_SHELL_ALPHA = 0.18
 BUILD_AXIS_ALIGNED_BBOX_SHELLS = False
 
 # Floor-plate thicknesses (m). F2 plate spans 3.09 -> 3.39 (=0.30 m thick).
@@ -355,12 +352,22 @@ def _make_material(name, color_rgba, alpha=1.0, blend_method="OPAQUE"):
     except Exception:
         pass
     if blend_method == "BLEND":
+        # Reasonable defaults for translucent reference materials.
         for attr, val in (("show_transparent_back", False),
                           ("shadow_method", "HASHED")):
             try:
                 setattr(mat, attr, val)
             except Exception:
                 pass
+        # Roof cap and outer-shell reference materials must not darken the
+        # interior — disable shadow casting where Blender supports it.
+        if name in ("MAT_Roof_Cap_Translucent", "MAT_OuterShell_Reference"):
+            for attr, val in (("shadow_method", "NONE"),
+                              ("use_shadow", False)):
+                try:
+                    setattr(mat, attr, val)
+                except Exception:
+                    pass
     return mat
 
 
@@ -1034,6 +1041,13 @@ def _build_window_markers(row, log):
 
 
 def _build_label(row, log, reason="label/empty fallback"):
+    """In DEBUG_MODE, place an empty + text label at the row's center.
+    With DEBUG_MODE=False, leave nothing in the scene — just log."""
+    log["labels_only"].append({
+        "row": row["row"], "element_id": row["element_id"], "reason": reason,
+    })
+    if not DEBUG_MODE:
+        return None
     dm = row["dims_m_from_grid"]
     x = dm.get("center_x_m")
     y = dm.get("center_y_m")
@@ -1044,34 +1058,33 @@ def _build_label(row, log, reason="label/empty fallback"):
     z = safe_float(row["dims"].get("base_z_m")) or 0.0
     name = safe_object_name("MARK", row["element_id"])
     label_text = row.get("element_id")
-    obj = make_label_empty(name, x or 0.0, y or 0.0, z, row["collection_target"],
-                           label_text=label_text)
-    log["labels_only"].append({
-        "row": row["row"], "element_id": row["element_id"], "reason": reason,
-    })
-    return obj
+    return make_label_empty(name, x or 0.0, y or 0.0, z,
+                            row["collection_target"], label_text=label_text)
 
 
 def _build_spawn(spawn, log):
     if not spawn or spawn.get("x_m") is None or spawn.get("y_m") is None:
         log["warnings"].append("spawn record missing or invalid")
         return
+    if not DEBUG_MODE:
+        # Sparse review pass: no spawn marker, no arrow. Spawn data is still
+        # in the JSON so a future build can place it.
+        log["spawn_skipped"] = "DEBUG_MODE=False"
+        return
     mat = _ensure("MAT_Debug_SpawnRed")
     name = "SPAWN_REDCROSS"
-    # Red cross marker: thin disk + arrow stub facing south (-Y).
     make_box_centered(
         name + "_BASE",
         spawn["x_m"], spawn["y_m"], 0.025,
         1.22, 1.22, 0.05,
         "NIMA_Spawn", mat,
     )
-    if DEBUG_MODE:
-        make_box_centered(
-            name + "_ARROW",
-            spawn["x_m"], spawn["y_m"] - 0.6, 0.06,
-            0.18, 1.2, 0.04,
-            "NIMA_Spawn", mat,
-        )
+    make_box_centered(
+        name + "_ARROW",
+        spawn["x_m"], spawn["y_m"] - 0.6, 0.06,
+        0.18, 1.2, 0.04,
+        "NIMA_Spawn", mat,
+    )
     log["objects_created"].append({
         "row": spawn.get("row"), "element_id": spawn.get("element_id"),
         "kind": "spawn", "x_m": spawn["x_m"], "y_m": spawn["y_m"],
@@ -1433,8 +1446,15 @@ def _role_highbay(row, ctx, log):
 
 
 def _role_cutout_f2(row, ctx, log):
-    """ZONE_STAIRS / ZONE_HIGHBAY_VOID: build hidden Boolean cutter + outline.
-    Never produces a solid exportable box for the cutout itself."""
+    """ZONE_STAIRS / ZONE_HIGHBAY_VOID.
+
+    Sparse-pass behavior:
+      - APPLY_BOOLEAN_CUTOUTS=False -> no cutter, no Boolean ever.
+      - SHOW_CUTOUT_VOLUMES=False    -> no translucent debug preview box.
+      - SHOW_CUTOUT_OUTLINES=False   -> no thin outline at slab top.
+    With all three false (the new defaults) this row produces NO geometry —
+    the stair / void area simply remains visually open.
+    """
     eid = row["element_id"]
     dm = row["dims_m_from_grid"]
     x0, y0 = dm.get("min_x_m"), dm.get("min_y_m")
@@ -1445,29 +1465,30 @@ def _role_cutout_f2(row, ctx, log):
         })
         return
 
-    cutter_name = safe_object_name("_CUTTER", eid)
-    cutter = make_cutter_box(
-        cutter_name, x0, y0, x1, y1,
-        F2_SLAB_BASE_Z, F2_SLAB_TOP_Z, padding=0.05,
-    )
-    if cutter is None:
-        log["cutouts_skipped"].append({
-            "row": row["row"], "element_id": eid,
-            "reason": "cutter creation failed",
-        })
-        return
-
-    ctx["cutters"].append({
-        "row": row["row"], "element_id": eid, "obj": cutter,
-        "bbox_m": (x0, y0, x1, y1),
-    })
     log["cutouts_recorded"].append({
         "row": row["row"], "element_id": eid,
         "bbox_m": (x0, y0, x1, y1),
     })
 
+    if APPLY_BOOLEAN_CUTOUTS:
+        cutter = make_cutter_box(
+            safe_object_name("_CUTTER", eid), x0, y0, x1, y1,
+            F2_SLAB_BASE_Z, F2_SLAB_TOP_Z, padding=0.05,
+        )
+        if cutter is None:
+            log["cutouts_skipped"].append({
+                "row": row["row"], "element_id": eid,
+                "reason": "cutter creation failed",
+            })
+        else:
+            ctx["cutters"].append({
+                "row": row["row"], "element_id": eid, "obj": cutter,
+                "bbox_m": (x0, y0, x1, y1),
+            })
+    else:
+        log["boolean_skipped_reason"] = "APPLY_BOOLEAN_CUTOUTS=False"
+
     if SHOW_CUTOUT_VOLUMES:
-        # Optional debug preview (translucent) so the user can see the void.
         debug_mat = _ensure("MAT_Debug_OpenToBelow")
         d_top = safe_float(row["dims"].get("top_z_m")) or F2_SLAB_TOP_Z
         d_base = safe_float(row["dims"].get("base_z_m")) or F2_SLAB_BASE_Z
@@ -1477,19 +1498,21 @@ def _role_cutout_f2(row, ctx, log):
             "NIMA_Debug_Reference", debug_mat,
         )
         if preview is not None:
-            preview.hide_render = True  # debug only — never export
+            preview.hide_render = True
             log["cutout_previews"].append({"element_id": eid,
                                            "name": preview.name})
-    else:
-        # Thin outline so the hole is legible after Boolean cuts the slab.
+
+    if SHOW_CUTOUT_OUTLINES:
+        # Use the translucent open-to-below color (NOT a dark/black material)
+        # so a thin outline at slab top doesn't read as a solid black box.
         outline_mat = _ensure("MAT_Debug_OpenToBelow")
         edge_z = F2_SLAB_TOP_Z + 0.001
-        edge_h = 0.05
+        edge_h = 0.04
         outline = make_bbox_perimeter_walls(
             safe_object_name("CUTOUT_OUTLINE", eid),
             x0, y0, x1, y1,
             edge_z - edge_h * 0.5, edge_z + edge_h * 0.5,
-            0.04, "NIMA_Debug_Reference", outline_mat,
+            0.03, "NIMA_Debug_Reference", outline_mat,
         )
         log["cutout_outlines"].append({
             "element_id": eid, "n_edges": len(outline),
@@ -1499,6 +1522,12 @@ def _role_cutout_f2(row, ctx, log):
 def _role_f2_edge_outline(row, ctx, log):
     """ZONE_HIGHBAY_OVERLOOK: thin perimeter outline at F2 slab top, no solid."""
     eid = row["element_id"]
+    if not BUILD_EDGE_RAILS:
+        log["edges_skipped"].append({
+            "row": row["row"], "element_id": eid,
+            "reason": "BUILD_EDGE_RAILS=False",
+        })
+        return
     dm = row["dims_m_from_grid"]
     x0, y0 = dm.get("min_x_m"), dm.get("min_y_m")
     x1, y1 = dm.get("max_x_m"), dm.get("max_y_m")
@@ -1520,6 +1549,12 @@ def _role_f2_edge_outline(row, ctx, log):
 def _role_edge_rail_bbox(row, ctx, log):
     """Thin perimeter rail/edge solid using row Base/Top Z."""
     eid = row["element_id"]
+    if not BUILD_EDGE_RAILS:
+        log["edges_skipped"].append({
+            "row": row["row"], "element_id": eid,
+            "reason": "BUILD_EDGE_RAILS=False",
+        })
+        return
     d = row["dims"]
     dm = row["dims_m_from_grid"]
     x0, y0 = dm.get("min_x_m"), dm.get("min_y_m")
@@ -1619,9 +1654,13 @@ def _role_f2_overlook_glass_per_edge(row, ctx, log):
 
 
 def _role_f2_slab_envelope_seed(row, ctx, log):
+    """SLAB_F2_CENTRAL has no X/Y footprint. With BUILD_DERIVED_F2_SLAB_ENVELOPE
+    off, this row produces no geometry and no label — only a log entry. An
+    accepted F2 slab polygon is required before a real F2 slab can be built."""
     log["f2_slab_envelope_seeds"].append({
         "row": row["row"], "element_id": row["element_id"],
-        "note": "footprint missing; DERIVED_F2_SLAB_ENVELOPE handles slab",
+        "note": ("Treated as reference rule only. "
+                 "Exact F2 slab polygon required for future phase."),
     })
 
 
@@ -1855,6 +1894,13 @@ def _gather_f2_extents(rows):
 
 
 def _build_derived_f2_envelope(rows, ctx, log):
+    if not BUILD_DERIVED_F2_SLAB_ENVELOPE:
+        log["derived_f2_slab"] = {
+            "built": False,
+            "reason": ("BUILD_DERIVED_F2_SLAB_ENVELOPE=False; exact F2 slab "
+                       "polygon required for future phase."),
+        }
+        return None
     if not BUILD_FLOOR_PLATES:
         log["derived_f2_slab"] = {"built": False,
                                   "reason": "BUILD_FLOOR_PLATES=False"}
@@ -1992,10 +2038,13 @@ def write_validation_report(log, json_path):
     add(f"DEBUG_MODE:                          {DEBUG_MODE}")
     add(f"SHOW_REFERENCE_VOLUMES:              {SHOW_REFERENCE_VOLUMES}")
     add(f"SHOW_CUTOUT_VOLUMES:                 {SHOW_CUTOUT_VOLUMES}")
+    add(f"SHOW_CUTOUT_OUTLINES:                {SHOW_CUTOUT_OUTLINES}")
     add(f"BUILD_FLOOR_PLATES:                  {BUILD_FLOOR_PLATES}")
     add(f"BUILD_DERIVED_WALLS:                 {BUILD_DERIVED_WALLS}")
+    add(f"BUILD_DERIVED_F2_SLAB_ENVELOPE:      {BUILD_DERIVED_F2_SLAB_ENVELOPE}")
     add(f"APPLY_BOOLEAN_CUTOUTS:               {APPLY_BOOLEAN_CUTOUTS}")
     add(f"DELETE_BOOLEAN_CUTTERS_AFTER_APPLY:  {DELETE_BOOLEAN_CUTTERS_AFTER_APPLY}")
+    add(f"BUILD_EDGE_RAILS:                    {BUILD_EDGE_RAILS}")
     add(f"BUILD_DOOR_MARKERS:                  {BUILD_DOOR_MARKERS}")
     add(f"BUILD_WINDOW_MARKERS:                {BUILD_WINDOW_MARKERS}")
     add(f"BUILD_GLASS_WALLS:                   {BUILD_GLASS_WALLS}")
@@ -2054,16 +2103,24 @@ def write_validation_report(log, json_path):
         add(f"  - row {dr.get('row','?')} {dr.get('element_id')} -> {dr.get('name')}")
     add()
 
-    add("Edge / rail elements:")
-    add(f"  rails:    {len(log['edge_rails'])}")
+    add("Edge / rail elements (BUILD_EDGE_RAILS):")
+    add(f"  rails built:    {len(log['edge_rails'])}")
     for er in log["edge_rails"]:
         add(f"    - row {er.get('row','?')} {er.get('element_id')} "
             f"segs={er.get('n_segments')}")
-    add(f"  outlines: {len(log['edge_outlines'])}")
+    add(f"  outlines built: {len(log['edge_outlines'])}")
     for eo in log["edge_outlines"]:
         add(f"    - row {eo.get('row','?')} {eo.get('element_id')} "
             f"edges={eo.get('n_edges')}")
+    add(f"  rows skipped:   {len(log['edges_skipped'])}")
+    for s in log["edges_skipped"]:
+        add(f"    - row {s.get('row','?')} {s.get('element_id')}: "
+            f"{s.get('reason')}")
     add()
+
+    if log.get("spawn_skipped"):
+        add(f"Spawn marker: skipped ({log['spawn_skipped']}).")
+        add()
 
     add("Doors (BUILD_DOOR_MARKERS):")
     add(f"  doors built:   {len(log['doors'])}")
@@ -2102,7 +2159,7 @@ def write_validation_report(log, json_path):
         add("  (no record — F2 overlook glass row may not have processed)")
     add()
 
-    add("F2 cutouts (stair / high-bay void):")
+    add("F2 cutouts (ZONE_STAIRS / ZONE_HIGHBAY_VOID):")
     add(f"  recorded: {len(log['cutouts_recorded'])}")
     for c in log["cutouts_recorded"]:
         add(f"  - row {c.get('row')} {c.get('element_id')} bbox_m={c.get('bbox_m')}")
@@ -2110,20 +2167,24 @@ def write_validation_report(log, json_path):
         add(f"  skipped:")
         for c in log["cutouts_skipped"]:
             add(f"  - row {c.get('row')} {c.get('element_id')}: {c.get('reason')}")
-    add(f"  outlines drawn at slab top: {len(log['cutout_outlines'])}")
-    if SHOW_CUTOUT_VOLUMES:
-        add(f"  debug previews kept (SHOW_CUTOUT_VOLUMES=True): "
-            f"{len(log['cutout_previews'])}")
-    add(f"  Boolean attempted: {len(log['boolean_attempted'])}")
-    add(f"  Boolean applied:   {len(log['boolean_applied'])}")
+    add(f"  outlines drawn at slab top:        {len(log['cutout_outlines'])}"
+        + ("" if SHOW_CUTOUT_OUTLINES else "  (SHOW_CUTOUT_OUTLINES=False)"))
+    add(f"  cutout previews:                   {len(log['cutout_previews'])}"
+        + ("" if SHOW_CUTOUT_VOLUMES else "  (SHOW_CUTOUT_VOLUMES=False)"))
+    add(f"  Boolean attempted:                 {len(log['boolean_attempted'])}")
+    add(f"  Boolean applied:                   {len(log['boolean_applied'])}")
     if log["boolean_failed"]:
-        add(f"  Boolean FAILED:    {len(log['boolean_failed'])}")
+        add(f"  Boolean FAILED:                    {len(log['boolean_failed'])}")
         for b in log["boolean_failed"]:
             add(f"    - target={b.get('target')} cutter={b.get('cutter')}: "
                 f"{b.get('error')}")
-    add(f"  Boolean cutters deleted: {len(log['boolean_cutters_deleted'])}")
+    add(f"  Boolean cutters deleted:           {len(log['boolean_cutters_deleted'])}")
     if log.get("boolean_skipped_reason"):
-        add(f"  Boolean skipped: {log['boolean_skipped_reason']}")
+        add(f"  Boolean skipped:                   {log['boolean_skipped_reason']}")
+    if not APPLY_BOOLEAN_CUTOUTS and not SHOW_CUTOUT_OUTLINES \
+            and not SHOW_CUTOUT_VOLUMES:
+        add("  Confirmation: no stair cutout box, no void box, no outline. "
+            "Stair / void areas remain visually open.")
     add()
 
     add("Roof / top reference:")
@@ -2206,22 +2267,26 @@ def write_validation_report(log, json_path):
         f"{'YES' if not BUILD_DOOR_MARKERS else 'NO (BUILD_DOOR_MARKERS=True)'}")
     add(f"  No window markers generated: "
         f"{'YES' if not BUILD_WINDOW_MARKERS else 'NO (BUILD_WINDOW_MARKERS=True)'}")
+    add(f"  No edge rails / void edges generated: "
+        f"{'YES' if not BUILD_EDGE_RAILS else 'NO (BUILD_EDGE_RAILS=True)'}")
+    cap_info = log.get("roof_cap") or {}
     add(f"  Roof cap material blend_method = BLEND: "
-        f"{'YES' if (log.get('roof_cap') or {}).get('blend_method') == 'BLEND' else 'n/a'}")
-    add("  Roof-projected outer shell is reference only "
-        "(no collision, no walls, not a nav boundary).")
+        f"{'YES' if cap_info.get('blend_method') == 'BLEND' else 'n/a'}")
+    add(f"  Roof cap material shadow_method = NONE: "
+        f"{'YES' if cap_info.get('built') else 'n/a'} "
+        f"(applied where Blender supports it).")
+    add(f"  DERIVED_F2_SLAB_ENVELOPE created: "
+        f"{'NO (BUILD_DERIVED_F2_SLAB_ENVELOPE=False)' if not BUILD_DERIVED_F2_SLAB_ENVELOPE else 'YES'}")
+    add(f"  OUTER_SHELL_REFERENCE_ENVELOPE created: "
+        f"{'NO (BUILD_OUTER_SHELL_FROM_ROOF_POLYGON=False)' if not BUILD_OUTER_SHELL_FROM_ROOF_POLYGON else 'YES'}")
+    add("  Roof shown as cap/outline only (no projected shell, no parapet).")
     add("  Roof overhang NOT used as literal wall boundary.")
     if ALIGN_BUILDING_TO_ROOF and not BUILD_AXIS_ALIGNED_BBOX_SHELLS:
         add("  Axis-aligned bbox shells suppressed "
             "(ALIGN_BUILDING_TO_ROOF=True, BUILD_AXIS_ALIGNED_BBOX_SHELLS=False).")
-        add("  Building below roof: floors + accepted polygon walls + glass; "
-            "exterior shell shown only as the translucent roof-projected envelope.")
-    add(f"  ZONE_STAIRS rendered as solid: NO "
-        f"(used as Boolean cutter; cutters deleted="
-        f"{DELETE_BOOLEAN_CUTTERS_AFTER_APPLY}).")
-    add(f"  ZONE_HIGHBAY_VOID rendered as solid: NO "
-        f"(used as Boolean cutter; cutters deleted="
-        f"{DELETE_BOOLEAN_CUTTERS_AFTER_APPLY}).")
+        add("  High-bay perimeter walls skipped pending accepted angled polygon.")
+    add("  ZONE_STAIRS rendered as solid: NO (no cutter, no outline, no rail).")
+    add("  ZONE_HIGHBAY_VOID rendered as solid: NO (no cutter, no outline).")
     add("  F2 overlook built as polygon slab plate (3.09–3.39 m), not full block.")
     add("  High-bay built as concrete floor + simple industrial perimeter walls.")
     add("  Roof built as outline only by default (filled volume only when "
@@ -2310,6 +2375,9 @@ def main():
         "roof_skipped": [],
         "roof_cap": None,
         "outer_shell_reference": None,
+        # Sparse review pass:
+        "edges_skipped": [],
+        "spawn_skipped": None,
     }
 
     geometry_rows = data.get("geometry_rows") or []
